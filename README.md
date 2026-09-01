@@ -87,6 +87,27 @@ The router exposes configured computers as projects/logical sessions, similar to
 
 Create a **new** OpenAI tunnel and a **new** Host Sandbox plugin/app for this endpoint. The existing Development Sandbox tunnel stays independent and does not need to be modified.
 
+### Wake computers on demand
+
+A remote computer can stay powered off and be woken automatically on the first Host Sandbox tool call. Configure Wake-on-LAN on the hub:
+
+```json
+{
+  "name": "rtx3090",
+  "ssh": "jirka@192.168.50.123",
+  "wake_on_lan": {
+    "mac": "AA:BB:CC:DD:EE:FF",
+    "broadcast": "192.168.50.255",
+    "port": 9,
+    "timeout_seconds": 120
+  }
+}
+```
+
+The hub first probes SSH. If the host is offline, it sends the standard Wake-on-LAN magic packet and waits until SSH becomes reachable before starting the remote MCP stdio session. `wake_host(project=...)` is also available for an explicit wake. `list_projects`/`/health` report whether a host is wake-capable without waking it.
+
+Wake-on-LAN requires firmware/NIC support and generally works over the local Ethernet broadcast domain; do not use a Tailscale address as the broadcast target.
+
 ## Run as systemd user services
 
 On a Linux hub, after `host-sandbox`, `hosts.json`, the tunnel-client binary, and the `host-sandbox` tunnel profile are configured:

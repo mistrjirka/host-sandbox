@@ -100,6 +100,7 @@ _TOOL_TITLES = {
     "write_binary_file": "Write binary file",
     "list_processes": "List host processes",
     "signal_process": "Signal host process",
+    "wake_host": "Wake host",
 }
 
 _READ_ONLY_TOOLS = {
@@ -140,6 +141,7 @@ ROUTER_TOOLS: list[dict[str, Any]] = [
     {"name": "list_sessions", "description": "List logical host sessions. A session selects one computer but does not create a container.", "inputSchema": _obj({"active_only": {"type": "boolean", "default": False}})},
     {"name": "create_session", "description": "Create a logical session for a configured computer. No container is created; tools run directly on that host OS.", "inputSchema": _obj({"project": {"type": "string"}, "label": {"type": ["string", "null"], "maxLength": 100}}, ["project"])},
     {"name": "destroy_session", "description": "Remove a logical host session. Files and processes on the computer are not deleted.", "inputSchema": _obj({"session_id": {"type": "string"}}, ["session_id"])},
+    {"name": "wake_host", "description": "Wake a configured computer using Wake-on-LAN and optionally wait until SSH is reachable.", "inputSchema": _obj({"project": {"type": "string"}, "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 600, "default": 120}}, ["project"])},
     {"name": "path_info", "description": "Inspect a file or directory on the selected computer.", "inputSchema": _session_schema({"repo": {"type": "string", "default": "."}, "path": {"type": "string", "default": "."}, "include_hidden": {"type": "boolean", "default": True}, "max_entries": {"type": "integer", "minimum": 1, "maximum": 20000, "default": 2000}})},
     {"name": "list_repositories", "description": "Discover Git repositories below the selected computer's workspace root.", "inputSchema": _session_schema({"max_depth": {"type": "integer", "minimum": 1, "maximum": 8, "default": 3}, "limit": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 1000}})},
     {"name": "exec_command", "description": "Run an unrestricted command directly on the selected computer.", "inputSchema": _session_schema({"command": {"type": "string", "maxLength": 1000000}, "cwd": {"type": "string", "default": "."}, "env": {"type": ["object", "null"], "additionalProperties": {"type": "string"}}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 604800, "default": 3600}, "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 20, "default": 8}, "max_output_bytes": {"type": "integer", "minimum": 1000, "maximum": 2097152, "default": 131072}}, ["command"])},
@@ -238,6 +240,11 @@ class RouterMCP:
             with self._lock:
                 rows = [asdict(s) for s in self._sessions.values() if not active_only or s.running]
             return {"sessions": rows}
+        if name == "wake_host":
+            project = str(a["project"])
+            if project not in self.router.hosts:
+                raise KeyError(f"unknown project/host: {project}")
+            return self.router.wake_host(project, int(a.get("wait_seconds", 120)))
         if name == "create_session":
             project = str(a["project"])
             if project not in self.router.hosts: raise KeyError(f"unknown project/host: {project}")

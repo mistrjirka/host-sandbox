@@ -1,0 +1,37 @@
+from __future__ import annotations
+
+from typing import Any
+
+
+def _obj(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
+    schema: dict[str, Any] = {"type": "object", "properties": properties, "additionalProperties": False}
+    if required:
+        schema["required"] = required
+    return schema
+
+
+def tool_definitions() -> list[dict[str, Any]]:
+    read = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
+    write = {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False}
+    exec_ann = {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True}
+    return [
+        {"name": "system_info", "description": "Show host OS/runtime identity and confirm this is unrestricted host mode.", "inputSchema": _obj({}), "annotations": read},
+        {"name": "path_info", "description": "Stat any host path. Relative paths use the server working directory.", "inputSchema": _obj({"path": {"type": "string"}}, ["path"]), "annotations": read},
+        {"name": "list_dir", "description": "List a host directory.", "inputSchema": _obj({"path": {"type": "string", "default": "."}, "max_entries": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 500}}), "annotations": read},
+        {"name": "read_file", "description": "Read UTF-8-ish text from any host file with byte offset pagination.", "inputSchema": _obj({"path": {"type": "string"}, "offset": {"type": "integer", "minimum": 0, "default": 0}, "max_bytes": {"type": "integer", "minimum": 1, "maximum": 1048576, "default": 262144}}, ["path"]), "annotations": read},
+        {"name": "read_file_chunk", "description": "Transfer an arbitrary binary file from the host as a base64 chunk (max 1 MiB decoded).", "inputSchema": _obj({"path": {"type": "string"}, "offset": {"type": "integer", "minimum": 0, "default": 0}, "length": {"type": "integer", "minimum": 1, "maximum": 1048576, "default": 524288}}, ["path"]), "annotations": read},
+        {"name": "write_file", "description": "Write or append a text file anywhere the host user can access.", "inputSchema": _obj({"path": {"type": "string"}, "content": {"type": "string"}, "mode": {"type": "string", "enum": ["overwrite", "append", "exclusive"], "default": "overwrite"}, "create_parents": {"type": "boolean", "default": True}}, ["path", "content"]), "annotations": write},
+        {"name": "replace_text", "description": "Replace exact text in a host file, optionally asserting the expected match count.", "inputSchema": _obj({"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}, "count": {"type": "integer", "minimum": 0, "default": 0}, "expected_matches": {"type": ["integer", "null"], "minimum": 0}}, ["path", "old", "new"]), "annotations": write},
+        {"name": "write_file_chunk", "description": "Transfer an arbitrary binary file to the host using base64 chunks (max 1 MiB decoded per call).", "inputSchema": _obj({"path": {"type": "string"}, "data_base64": {"type": "string"}, "offset": {"type": "integer", "minimum": 0, "default": 0}, "create_parents": {"type": "boolean", "default": True}, "truncate_after": {"type": "boolean", "default": False}, "final_sha256": {"type": "boolean", "default": False}}, ["path", "data_base64"]), "annotations": write},
+        {"name": "hash_file", "description": "Hash a host file for transfer/integrity verification.", "inputSchema": _obj({"path": {"type": "string"}, "algorithm": {"type": "string", "default": "sha256"}}, ["path"]), "annotations": read},
+        {"name": "file_op", "description": "Create, touch, remove, copy, move, or chmod a host path.", "inputSchema": _obj({"action": {"type": "string", "enum": ["mkdir", "touch", "remove", "copy", "move", "chmod"]}, "path": {"type": "string"}, "destination": {"type": ["string", "null"]}, "recursive": {"type": "boolean", "default": False}, "mode": {"type": ["string", "null"]}}, ["action", "path"]), "annotations": write},
+        {"name": "find_paths", "description": "Find files/directories by shell-style glob beneath any host path.", "inputSchema": _obj({"pattern": {"type": "string"}, "path": {"type": "string", "default": "."}, "max_results": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 500}, "max_depth": {"type": "integer", "minimum": 0, "maximum": 100, "default": 20}}, ["pattern"]), "annotations": read},
+        {"name": "search_text", "description": "Search text across host files; uses ripgrep when available.", "inputSchema": _obj({"query": {"type": "string"}, "path": {"type": "string", "default": "."}, "max_results": {"type": "integer", "minimum": 1, "maximum": 2000, "default": 200}, "fixed_strings": {"type": "boolean", "default": False}}, ["query"]), "annotations": read},
+        {"name": "exec_command", "description": "Run an unrestricted shell command directly on the host. Longer commands become jobs and can be polled.", "inputSchema": _obj({"command": {"type": "string"}, "cwd": {"type": ["string", "null"]}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 604800, "default": 3600}, "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 20, "default": 8}, "max_output_bytes": {"type": "integer", "minimum": 1000, "maximum": 2097152, "default": 131072}, "env": {"type": ["object", "null"], "additionalProperties": {"type": "string"}}}, ["command"]), "annotations": exec_ann},
+        {"name": "exec_commands", "description": "Run up to 32 independent unrestricted host commands concurrently.", "inputSchema": _obj({"commands": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "properties": {"command": {"type": "string"}, "cwd": {"type": ["string", "null"]}, "timeout_seconds": {"type": "integer"}, "wait_seconds": {"type": "integer"}, "max_output_bytes": {"type": "integer"}, "env": {"type": ["object", "null"], "additionalProperties": {"type": "string"}}}, "required": ["command"], "additionalProperties": False}}, "concurrency": {"type": "integer", "minimum": 1, "maximum": 16, "default": 8}}, ["commands"]), "annotations": exec_ann},
+        {"name": "list_jobs", "description": "List shell command jobs launched by this host-sandbox process.", "inputSchema": _obj({"limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100}}), "annotations": read},
+        {"name": "read_job", "description": "Read output and status from a shell command job.", "inputSchema": _obj({"job_id": {"type": "string"}, "offset": {"type": "integer", "minimum": 0, "default": 0}, "max_bytes": {"type": "integer", "minimum": 1, "maximum": 2097152, "default": 131072}}, ["job_id"]), "annotations": read},
+        {"name": "signal_job", "description": "Send a signal to a command job/process group.", "inputSchema": _obj({"job_id": {"type": "string"}, "sig": {"type": "string", "enum": ["TERM", "INT", "KILL", "HUP", "CONT", "STOP"], "default": "TERM"}}, ["job_id"]), "annotations": write},
+        {"name": "list_processes", "description": "List processes on the host OS.", "inputSchema": _obj({"max_processes": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 500}}), "annotations": read},
+        {"name": "signal_process", "description": "Send a Unix signal to any process the host user is allowed to signal.", "inputSchema": _obj({"pid": {"type": "integer", "minimum": 2}, "sig": {"type": "string", "enum": ["TERM", "INT", "KILL", "HUP", "CONT", "STOP"], "default": "TERM"}}, ["pid"]), "annotations": write},
+    ]

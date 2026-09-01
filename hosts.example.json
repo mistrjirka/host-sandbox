@@ -1,0 +1,7 @@
+{
+  "hosts": [
+    {"name": "laptop", "ssh": "jirka@laptop.tailnet-name.ts.net"},
+    {"name": "grammetry", "ssh": "jirka@grammetry.tailnet-name.ts.net"},
+    {"name": "server", "ssh": "jirka@server.tailnet-name.ts.net"}
+  ]
+}

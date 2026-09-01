@@ -1,0 +1,9 @@
+[project]
+name = "host-sandbox"
+version = "0.1.0"
+description = "Host-native agent bridge with full filesystem/command access and a live audit UI"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+[project.scripts]
+host-sandbox = "host_sandbox.cli:main"

@@ -1,0 +1,17 @@
+[Unit]
+Description=OpenAI Secure MCP Tunnel for Host Sandbox
+Documentation=https://github.com/openai/tunnel-client
+After=host-sandbox-router.service
+Requires=host-sandbox-router.service
+PartOf=host-sandbox-router.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/host-sandbox/tunnel.env
+ExecStart=%h/programy/tunnel-client/tunnel-client run --profile host-sandbox
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

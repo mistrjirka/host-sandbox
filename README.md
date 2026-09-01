@@ -87,6 +87,33 @@ The router exposes configured computers as projects/logical sessions, similar to
 
 Create a **new** OpenAI tunnel and a **new** Host Sandbox plugin/app for this endpoint. The existing Development Sandbox tunnel stays independent and does not need to be modified.
 
+## Run as systemd user services
+
+On a Linux hub, after `host-sandbox`, `hosts.json`, the tunnel-client binary, and the `host-sandbox` tunnel profile are configured:
+
+```bash
+# Keep the runtime key out of the repository. The setup script stores it as a 0600 file.
+export TUNNELKEY='your-runtime-key'
+./setup-services.sh
+
+# Allow user services to start at boot before you log in.
+sudo loginctl enable-linger "$USER"
+```
+
+The installer creates and starts:
+
+- `host-sandbox-router.service`
+- `host-sandbox-tunnel.service`
+
+Check them with:
+
+```bash
+systemctl --user status host-sandbox-router host-sandbox-tunnel
+journalctl --user -u host-sandbox-router -u host-sandbox-tunnel -f
+```
+
+The router service defaults to `127.0.0.1:8766`, which is sufficient for Secure MCP Tunnel. To intentionally expose it on the LAN/VPN, edit `~/.config/host-sandbox/router.env`, set `HOST_SANDBOX_ROUTER_BIND=0.0.0.0`, and restart the router. If exposing the MCP endpoint to other machines, protect it with a token/firewall/private network.
+
 ## Local dashboard
 
 `host-sandbox serve --open` opens the activity screen. It shows observable tool activity such as commands, file operations, jobs, exit states and output. It does not expose hidden model chain-of-thought.

@@ -1,0 +1,14 @@
+[Unit]
+Description=Host Sandbox multi-computer router
+Documentation=https://github.com/mistrjirka/host-sandbox
+
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-%h/.config/host-sandbox/router.env
+ExecStart=%h/.local/bin/host-sandbox router
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

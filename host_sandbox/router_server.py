@@ -70,7 +70,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             if not isinstance(req, dict):
                 raise ValueError("JSON-RPC request must be an object")
             if path == "/mcp":
-                response = self.server.aggregate_mcp.handle(req)
+                response = self.server.aggregate_mcp.handle(req, self.headers.get("MCP-Protocol-Version"))
                 if response is None:
                     self.send_response(202); self.send_header("Content-Length", "0"); self.end_headers(); return
                 return self._json(response)

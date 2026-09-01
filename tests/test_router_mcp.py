@@ -57,7 +57,7 @@ class RouterMCPTests(unittest.TestCase):
         discover = mcp.handle({"jsonrpc":"2.0","id":2,"method":"server/discover","params":{}})["result"]
         self.assertEqual(discover["supportedVersions"], ["2026-07-28"])
         self.assertEqual(discover["resultType"], "complete")
-        self.assertEqual(discover["cacheScope"], "public")
+        self.assertEqual(discover["cacheScope"], "private")
         self.assertIn("io.modelcontextprotocol/serverInfo", discover["_meta"])
 
 if __name__ == '__main__': unittest.main()

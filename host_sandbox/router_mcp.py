@@ -12,7 +12,7 @@ from .ssh_router import SSHRouter
 
 
 def _obj(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
-    out: dict[str, Any] = {"type": "object", "properties": properties, "additionalProperties": False}
+    out: dict[str, Any] = {"type": "object", "properties": properties}
     if required:
         out["required"] = required
     return out
@@ -28,8 +28,36 @@ def _display_title(name: str) -> str:
     return " ".join(part.capitalize() for part in name.split("_"))
 
 
+def _normalize_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Normalize equivalent JSON Schema spellings to MCP SDK/Pydantic style."""
+    types = schema.get("type")
+    if isinstance(types, list):
+        extras = {k: v for k, v in schema.items() if k != "type"}
+        branches: list[dict[str, Any]] = []
+        for typ in types:
+            branch: dict[str, Any] = {"type": typ}
+            if typ == "object" and "additionalProperties" in extras:
+                branch["additionalProperties"] = extras["additionalProperties"]
+            if typ == "array" and "items" in extras:
+                branch["items"] = extras["items"]
+            branches.append(branch)
+        schema.clear()
+        schema.update({k: v for k, v in extras.items() if k not in {"additionalProperties", "items"}})
+        schema["anyOf"] = branches
+
+    for key, value in list(schema.items()):
+        if isinstance(value, dict):
+            _normalize_schema(value)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    _normalize_schema(item)
+    return schema
+
+
 def _add_schema_titles(schema: dict[str, Any], *, root_title: str | None = None) -> dict[str, Any]:
     """Make hand-written schemas resemble MCP SDK/Pydantic-generated schemas."""
+    _normalize_schema(schema)
     if root_title and "title" not in schema:
         schema["title"] = root_title
     props = schema.get("properties")
@@ -38,14 +66,16 @@ def _add_schema_titles(schema: dict[str, Any], *, root_title: str | None = None)
             if not isinstance(value, dict):
                 continue
             value.setdefault("title", _display_title(key))
-            if value.get("type") == "object":
-                _add_schema_titles(value)
-            items = value.get("items")
-            if isinstance(items, dict):
-                _add_schema_titles(items)
+            _add_schema_titles(value)
     items = schema.get("items")
     if isinstance(items, dict):
         _add_schema_titles(items)
+    for key in ("anyOf", "oneOf", "allOf"):
+        choices = schema.get(key)
+        if isinstance(choices, list):
+            for choice in choices:
+                if isinstance(choice, dict):
+                    _add_schema_titles(choice)
     return schema
 
 
@@ -113,7 +143,7 @@ ROUTER_TOOLS: list[dict[str, Any]] = [
     {"name": "path_info", "description": "Inspect a file or directory on the selected computer.", "inputSchema": _session_schema({"repo": {"type": "string", "default": "."}, "path": {"type": "string", "default": "."}, "include_hidden": {"type": "boolean", "default": True}, "max_entries": {"type": "integer", "minimum": 1, "maximum": 20000, "default": 2000}})},
     {"name": "list_repositories", "description": "Discover Git repositories below the selected computer's workspace root.", "inputSchema": _session_schema({"max_depth": {"type": "integer", "minimum": 1, "maximum": 8, "default": 3}, "limit": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 1000}})},
     {"name": "exec_command", "description": "Run an unrestricted command directly on the selected computer.", "inputSchema": _session_schema({"command": {"type": "string", "maxLength": 1000000}, "cwd": {"type": "string", "default": "."}, "env": {"type": ["object", "null"], "additionalProperties": {"type": "string"}}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 604800, "default": 3600}, "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 20, "default": 8}, "max_output_bytes": {"type": "integer", "minimum": 1000, "maximum": 2097152, "default": 131072}}, ["command"])},
-    {"name": "exec_commands", "description": "Run independent commands on one or more selected computers concurrently.", "inputSchema": _obj({"commands": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "properties": {"session_id": {"type": "string"}, "command": {"type": "string"}, "cwd": {"type": "string", "default": "."}, "env": {"type": ["object", "null"], "additionalProperties": {"type": "string"}}, "timeout_seconds": {"type": "integer", "default": 3600}, "wait_seconds": {"type": "integer", "default": 8}, "max_output_bytes": {"type": "integer", "default": 131072}}, "required": ["session_id", "command"], "additionalProperties": False}}, "concurrency": {"type": "integer", "minimum": 1, "maximum": 32, "default": 16}}, ["commands"])},
+    {"name": "exec_commands", "description": "Run independent commands on one or more selected computers concurrently.", "inputSchema": _obj({"commands": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "properties": {"session_id": {"type": "string"}, "command": {"type": "string"}, "cwd": {"type": "string", "default": "."}, "env": {"type": ["object", "null"], "additionalProperties": {"type": "string"}}, "timeout_seconds": {"type": "integer", "default": 3600}, "wait_seconds": {"type": "integer", "default": 8}, "max_output_bytes": {"type": "integer", "default": 131072}}, "required": ["session_id", "command"]}}, "concurrency": {"type": "integer", "minimum": 1, "maximum": 32, "default": 16}}, ["commands"])},
     {"name": "list_jobs", "description": "List recent command jobs for a host session.", "inputSchema": _session_schema({"limit": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 50}})},
     {"name": "get_job", "description": "Read a host command job and its paginated output.", "inputSchema": _session_schema({"job_id": {"type": "string"}, "stdout_offset": {"type": "integer", "minimum": 0, "default": 0}, "stderr_offset": {"type": "integer", "minimum": 0, "default": 0}, "max_bytes": {"type": "integer", "minimum": 1000, "maximum": 2097152, "default": 131072}}, ["job_id"])},
     {"name": "terminate_job", "description": "Stop a running command job on a computer.", "inputSchema": _session_schema({"job_id": {"type": "string"}, "signal": {"type": "string", "enum": ["TERM", "INT", "KILL", "HUP"], "default": "TERM"}, "force_after_seconds": {"type": "integer", "minimum": 0, "maximum": 60, "default": 5}}, ["job_id"])},
@@ -283,24 +313,24 @@ class RouterMCP:
         return {"io.modelcontextprotocol/serverInfo": {"name": "host-sandbox-router", "version": "0.3.0"}}
 
     @classmethod
-    def _modern_result(cls, payload: dict[str, Any], *, public: bool = False, ttl_ms: int = 0) -> dict[str, Any]:
-        return {
-            **payload,
-            "resultType": "complete",
-            "cacheScope": "public" if public else "private",
-            "ttlMs": ttl_ms,
-            "_meta": cls._server_meta(),
-        }
+    def _modern_result(cls, payload: dict[str, Any], *, cacheable: bool = False) -> dict[str, Any]:
+        result = {**payload, "resultType": "complete", "_meta": cls._server_meta()}
+        if cacheable:
+            # Match MCP SDK defaults: immediately stale and authorization-private.
+            result.update({"cacheScope": "private", "ttlMs": 0})
+        return result
 
     @staticmethod
-    def _is_modern(params: dict[str, Any]) -> bool:
+    def _is_modern(params: dict[str, Any], protocol_version: str | None = None) -> bool:
+        if protocol_version == "2026-07-28":
+            return True
         meta = params.get("_meta") if isinstance(params, dict) else None
         if not isinstance(meta, dict):
             return False
         version = meta.get("io.modelcontextprotocol/protocolVersion")
         return version == "2026-07-28"
 
-    def handle(self, req: dict[str, Any]) -> dict[str, Any] | None:
+    def handle(self, req: dict[str, Any], protocol_version: str | None = None) -> dict[str, Any] | None:
         rid = req.get("id"); method = req.get("method"); params = req.get("params") or {}
         if rid is None and str(method).startswith("notifications/"): return None
         try:
@@ -309,21 +339,24 @@ class RouterMCP:
                     "supportedVersions": ["2026-07-28"],
                     "capabilities": {"tools": {"listChanged": False}},
                     "instructions": "Multiple computers exposed through Development-Sandbox-style logical sessions. Tools execute directly on host OSes.",
-                }, public=True, ttl_ms=60_000)
+                }, cacheable=True)
             elif method == "initialize":
                 requested = str(params.get("protocolVersion") or "2025-11-25")
                 negotiated = requested if requested in {"2025-06-18", "2025-11-25"} else "2025-11-25"
                 result = {"protocolVersion": negotiated, "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "host-sandbox-router", "version": "0.3.0"}, "instructions": "Multiple computers exposed through Development-Sandbox-style logical sessions. Tools execute directly on host OSes."}
             elif method == "ping":
-                result = self._modern_result({}) if self._is_modern(params) else {}
+                result = self._modern_result({}) if self._is_modern(params, protocol_version) else {}
             elif method == "tools/list":
                 payload = {"tools": ROUTER_TOOLS}
-                result = self._modern_result(payload, public=True, ttl_ms=60_000) if self._is_modern(params) else payload
+                result = self._modern_result(payload, cacheable=True) if self._is_modern(params, protocol_version) else payload
             elif method == "tools/call":
                 name = params.get("name"); arguments = dict(params.get("arguments") or {})
-                payload = self.call(str(name), arguments)
-                body = {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, default=str, indent=2)}], "structuredContent": payload, "isError": False}
-                result = self._modern_result(body) if self._is_modern(params) else body
+                try:
+                    payload = self.call(str(name), arguments)
+                    body = {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, default=str, indent=2)}], "structuredContent": payload, "isError": False}
+                except Exception as exc:
+                    body = {"content": [{"type": "text", "text": f"{type(exc).__name__}: {exc}"}], "isError": True}
+                result = self._modern_result(body) if self._is_modern(params, protocol_version) else body
             else:
                 return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"Method not found: {method}"}}
             return {"jsonrpc": "2.0", "id": rid, "result": result}

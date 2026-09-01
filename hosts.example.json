@@ -1,7 +1,8 @@
 {
   "hosts": [
+    {"name": "hub", "local": true},
     {"name": "laptop", "ssh": "jirka@laptop.tailnet-name.ts.net"},
     {"name": "grammetry", "ssh": "jirka@grammetry.tailnet-name.ts.net"},
-    {"name": "server", "ssh": "jirka@server.tailnet-name.ts.net"}
+    {"name": "rtx3090", "ssh": "jirka@rtx3090.tailnet-name.ts.net"}
   ]
 }

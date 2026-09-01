@@ -12,8 +12,9 @@ from typing import Any
 @dataclass
 class HostConfig:
     name: str
-    ssh: str
+    ssh: str = ""
     command: str = "host-sandbox stdio"
+    local: bool = False
 
 
 class RemoteMCP:
@@ -26,8 +27,9 @@ class RemoteMCP:
     def _start(self) -> subprocess.Popen[str]:
         if self._proc and self._proc.poll() is None:
             return self._proc
+        argv = ["/bin/bash", "-lc", self.host.command] if self.host.local else ["ssh", "-T", self.host.ssh, self.host.command]
         self._proc = subprocess.Popen(
-            ["ssh", "-T", self.host.ssh, self.host.command],
+            argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -85,7 +87,9 @@ class SSHRouter:
         hosts = raw.get("hosts") or []
         parsed: dict[str, HostConfig] = {}
         for item in hosts:
-            h = HostConfig(name=str(item["name"]), ssh=str(item["ssh"]), command=str(item.get("command") or "host-sandbox stdio"))
+            h = HostConfig(name=str(item["name"]), ssh=str(item.get("ssh") or ""), command=str(item.get("command") or "host-sandbox stdio"), local=bool(item.get("local", False)))
+            if not h.local and not h.ssh:
+                raise ValueError(f"host {h.name!r} requires ssh or local=true")
             parsed[h.name] = h
         self.hosts = parsed
         for name in list(self.clients):
@@ -95,8 +99,11 @@ class SSHRouter:
     def list_hosts(self) -> dict[str, Any]:
         values = []
         for h in self.hosts.values():
+            if h.local:
+                values.append({"name": h.name, "local": True, "online": True})
+                continue
             proc = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", h.ssh, "printf ok"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5)
-            values.append({"name": h.name, "ssh": h.ssh, "online": proc.returncode == 0 and proc.stdout == "ok"})
+            values.append({"name": h.name, "ssh": h.ssh, "local": False, "online": proc.returncode == 0 and proc.stdout == "ok"})
         return {"hosts": values}
 
     def client(self, host: str) -> RemoteMCP:

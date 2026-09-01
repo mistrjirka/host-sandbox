@@ -7,15 +7,17 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from .ssh_router import SSHRouter
+from .router_mcp import RouterMCP
 
 
 class RouterHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, addr: tuple[str, int], router: SSHRouter, token: str | None):
+    def __init__(self, addr: tuple[str, int], router: SSHRouter, token: str | None, state_path: str | None = None):
         super().__init__(addr, RouterHandler)
         self.router = router
+        self.aggregate_mcp = RouterMCP(router, state_path)
         self.auth_token = token
 
 
@@ -58,20 +60,22 @@ class RouterHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
-        if not path.startswith("/mcp/"):
+        if path != "/mcp" and not path.startswith("/mcp/"):
             return self._json({"error": "not found"}, 404)
         if not self._authorized():
             return self._json({"error": "unauthorized"}, 401)
-        host = unquote(path[len("/mcp/"):])
-        if not host:
-            return self._json({"error": "missing host"}, 400)
         try:
             n = int(self.headers.get("Content-Length", "0"))
             req = json.loads(self.rfile.read(n) or b"{}")
             if not isinstance(req, dict):
                 raise ValueError("JSON-RPC request must be an object")
-            method = req.get("method")
-            params = req.get("params") or {}
+            if path == "/mcp":
+                response = self.server.aggregate_mcp.handle(req)
+                if response is None:
+                    self.send_response(202); self.send_header("Content-Length", "0"); self.end_headers(); return
+                return self._json(response)
+            host = unquote(path[len("/mcp/"):])
+            method = req.get("method"); params = req.get("params") or {}
             result = self.server.router.client(host).request(str(method), params)
             return self._json({"jsonrpc": "2.0", "id": req.get("id"), "result": result})
         except KeyError as exc:

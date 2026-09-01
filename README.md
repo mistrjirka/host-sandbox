@@ -63,6 +63,7 @@ On the central server create `~/.config/host-sandbox/hosts.json` from `hosts.exa
 ```json
 {
   "hosts": [
+    {"name": "hub", "local": true},
     {"name": "laptop", "ssh": "jirka@laptop"},
     {"name": "grammetry", "ssh": "jirka@grammetry"}
   ]
@@ -76,14 +77,15 @@ HOST_SANDBOX_ROUTER_TOKEN='use-a-long-random-token' \
   host-sandbox router --bind 127.0.0.1 --port 8766
 ```
 
-It exposes one MCP path per computer:
+For ChatGPT, use the single aggregate endpoint:
 
 ```text
-http://127.0.0.1:8766/mcp/laptop
-http://127.0.0.1:8766/mcp/grammetry
+http://127.0.0.1:8766/mcp
 ```
 
-A reverse proxy or OpenAI-supported tunnel can publish only the central router; individual computers need no public inbound port.
+The router exposes configured computers as projects/logical sessions, similar to Development Sandbox. `hub` with `local: true` runs directly on the Orange Pi; remote computers are reached through SSH. Per-host `/mcp/<host>` endpoints remain available for debugging.
+
+Create a **new** OpenAI tunnel and a **new** Host Sandbox plugin/app for this endpoint. The existing Development Sandbox tunnel stays independent and does not need to be modified.
 
 ## Local dashboard
 

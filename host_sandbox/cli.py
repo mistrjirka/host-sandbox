@@ -35,7 +35,7 @@ def parser() -> argparse.ArgumentParser:
     h.add_argument("--token", default=os.environ.get("HOST_SANDBOX_TOKEN"), help="optional bearer token for /mcp")
     h.add_argument("--open", action="store_true", help="open the dashboard in the default browser")
     sub.add_parser("stdio", help="serve MCP over stdio for local MCP clients")
-    r = sub.add_parser("router", help="central SSH router: one MCP endpoint per configured computer")
+    r = sub.add_parser("router", help="central multi-computer router with one aggregate MCP endpoint")
     r.add_argument("--config", default=os.environ.get("HOST_SANDBOX_HOSTS", str(Path.home()/".config/host-sandbox/hosts.json")))
     r.add_argument("--bind", default=os.environ.get("HOST_SANDBOX_ROUTER_BIND", "127.0.0.1"))
     r.add_argument("--port", type=int, default=int(os.environ.get("HOST_SANDBOX_ROUTER_PORT", "8766")))
@@ -48,9 +48,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode is None: args.mode = "serve"; args.bind = "127.0.0.1"; args.port = 8765; args.token = os.environ.get("HOST_SANDBOX_TOKEN"); args.open = False
     if args.mode == "router":
         router = SSHRouter(args.config)
-        server = RouterHTTPServer((args.bind, args.port), router, args.token)
+        server = RouterHTTPServer((args.bind, args.port), router, args.token, str(Path(args.config).expanduser().with_name("sessions.json")))
         print(f"Host Sandbox router: http://{args.bind}:{args.port}", flush=True)
-        print("Per-host MCP endpoint: /mcp/<host-name>", flush=True)
+        print("Aggregate MCP endpoint: /mcp", flush=True)
+        print("Per-host debug endpoint: /mcp/<host-name>", flush=True)
         try: run_router_http(server); return 0
         except KeyboardInterrupt: return 0
 

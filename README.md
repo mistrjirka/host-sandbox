@@ -5,14 +5,16 @@ Host-native MCP tool bridge inspired by the Development Sandbox. It runs tools d
 ## What it can do
 
 - unrestricted command execution as the launching user
-- text and binary file transfer
-- file write/replace/copy/move/remove/chmod
-- file search and path discovery
-- durable command jobs and process signalling
-- concurrent command execution
-- localhost MCP HTTP endpoint and stdio MCP transport
-- live browser dashboard for tool calls, jobs, output and errors
-- central multi-computer routing over ordinary SSH
+- separate paginated stdout/stderr durable jobs, termination, deletion and cleanup
+- text reads/writes plus native MCP binary resources and native image content (up to 16 MiB)
+- batched `read_files`, `search_many`, and concurrent `exec_commands`
+- Git patch validation/application and bounded status/diff inspection
+- persistent interactive tmux terminal reads, text input and control/navigation keys
+- host-scoped resource locks such as `gpu:all`
+- process listing/signalling and repository/path discovery
+- foreground outbound clients that appear only while `host-sandbox connect` is running
+- local activity dashboard plus an always-on Orange Pi router/OpenAI tunnel
+- optional static SSH hosts as a fallback transport
 
 This deliberately has **no container boundary**. Anything the launching user can modify can also be modified through the tool bridge.
 
@@ -69,7 +71,7 @@ Overrides are available when needed:
 host-sandbox --name custom-name connect --hub http://other-hub:8767
 ```
 
-The foreground client also starts a local activity dashboard at `http://127.0.0.1:8765/` unless `--no-dashboard` is supplied.
+The foreground client also starts a local activity dashboard at `http://127.0.0.1:8765/` unless `--no-dashboard` is supplied. Interactive terminal tools require `tmux` on that controlled computer; all other tools remain usable without tmux.
 
 The agent connection requires a shared token. The hub service installer generates it in `~/.config/host-sandbox/router.env`. Copy that value once to `~/.config/host-sandbox/client.env` on the client (mode `0600`):
 
@@ -122,7 +124,9 @@ The ChatGPT-facing router defaults to `127.0.0.1:8766`; the separate authenticat
 
 ## Current parity status
 
-The initial version implements the core capabilities needed for coding and host administration. Development Sandbox-specific conveniences such as exact session/container lifecycle emulation, tmux interaction, Git patch/status helper calls, image-native MCP content and the remaining batch helper aliases are being mirrored separately so the public tool surface can converge on the existing Development Sandbox.
+Version 0.5 exposes the same 30 public tool names as the current Development Sandbox, including `search_many`, `read_files`, native `read_binary_file` / `view_image`, Git helpers, separate stdout/stderr job pagination, job cleanup, resource locks, and tmux terminal controls. Binary and image payloads are returned as native MCP `EmbeddedResource` / `ImageContent` rather than duplicated inside structured JSON.
+
+The intentional architectural difference is session lifecycle: Development Sandbox sessions are isolated containers attached to persistent `/workspace`; Host Sandbox sessions are lightweight logical handles selecting a real computer and execute with the permissions of the user who started `host-sandbox connect`. Stopping that foreground client removes the computer from the hub. Static SSH transport remains optional for machines where that behavior is desired.
 
 ## Tests
 

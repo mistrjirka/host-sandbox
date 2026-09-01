@@ -68,8 +68,20 @@ class MCPServer:
 
     @staticmethod
     def _preview(value: Any, max_chars: int = 900) -> str:
+        def scrub(obj: Any) -> Any:
+            if isinstance(obj, dict):
+                out = {}
+                for key, item in obj.items():
+                    if key in {"content_base64", "data_base64", "blob", "data"} and isinstance(item, str) and len(item) > 512:
+                        out[key] = f"<{len(item)} encoded chars>"
+                    else:
+                        out[key] = scrub(item)
+                return out
+            if isinstance(obj, list):
+                return [scrub(item) for item in obj]
+            return obj
         try:
-            text = json.dumps(value, ensure_ascii=False, default=str)
+            text = json.dumps(scrub(value), ensure_ascii=False, default=str)
         except Exception:
             text = repr(value)
         return text if len(text) <= max_chars else text[:max_chars] + "…"

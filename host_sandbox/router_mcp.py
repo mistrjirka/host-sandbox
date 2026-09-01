@@ -5,6 +5,7 @@ import hashlib
 import json
 import threading
 import time
+from urllib.parse import quote
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
@@ -94,26 +95,38 @@ _TOOL_TITLES = {
     "exec_commands": "Execute commands",
     "list_jobs": "List command jobs",
     "get_job": "Get command job",
+    "delete_job": "Delete command job",
+    "cleanup_jobs": "Cleanup command jobs",
     "terminate_job": "Terminate command job",
     "search_project": "Search repository files",
+    "search_many": "Search many repository queries",
     "read_file": "Read repository file",
+    "read_files": "Read repository files",
     "write_file": "Write repository file",
     "replace_text": "Replace exact repository text",
     "read_binary_file": "Read binary file",
+    "view_image": "View image",
     "write_binary_file": "Write binary file",
+    "apply_patch": "Apply Git patch",
+    "git_status_diff": "Inspect Git status and diff",
     "list_processes": "List host processes",
+    "read_terminal": "Read interactive terminal",
+    "send_terminal_input": "Send interactive terminal input",
+    "send_terminal_key": "Send interactive terminal key",
     "signal_process": "Signal host process",
 }
 
 _READ_ONLY_TOOLS = {
     "sandbox_health", "list_projects", "list_sessions", "path_info",
-    "list_repositories", "list_jobs", "get_job", "search_project",
-    "read_file", "read_binary_file", "list_processes",
+    "list_repositories", "list_jobs", "get_job", "search_project", "search_many",
+    "read_file", "read_files", "read_binary_file", "view_image", "git_status_diff",
+    "list_processes", "read_terminal",
 }
-_OPEN_WORLD_TOOLS = {"exec_command", "exec_commands"}
+_OPEN_WORLD_TOOLS = {"exec_command", "exec_commands", "send_terminal_input"}
 _DESTRUCTIVE_TOOLS = {
-    "destroy_session", "exec_command", "exec_commands", "terminate_job",
-    "write_file", "replace_text", "write_binary_file", "signal_process",
+    "destroy_session", "exec_command", "exec_commands", "delete_job", "cleanup_jobs", "terminate_job",
+    "write_file", "replace_text", "write_binary_file", "apply_patch", "signal_process",
+    "send_terminal_input", "send_terminal_key",
 }
 
 
@@ -149,15 +162,25 @@ ROUTER_TOOLS: list[dict[str, Any]] = [
     {"name": "exec_commands", "description": "Run independent commands on one or more selected computers concurrently.", "inputSchema": _obj({"commands": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "properties": {"session_id": {"type": "string"}, "command": {"type": "string"}, "cwd": {"type": "string", "default": "."}, "env": {"type": ["object", "null"], "additionalProperties": {"type": "string"}}, "timeout_seconds": {"type": "integer", "default": 3600}, "wait_seconds": {"type": "integer", "default": 8}, "max_output_bytes": {"type": "integer", "default": 131072}, "resource_locks": {"type": "array", "items": {"type": "string"}, "maxItems": 16}}, "required": ["session_id", "command"]}}, "concurrency": {"type": "integer", "minimum": 1, "maximum": 32, "default": 16}}, ["commands"])},
     {"name": "list_jobs", "description": "List recent command jobs for a host session.", "inputSchema": _session_schema({"limit": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 50}})},
     {"name": "get_job", "description": "Read a host command job and its paginated output.", "inputSchema": _session_schema({"job_id": {"type": "string"}, "stdout_offset": {"type": "integer", "minimum": 0, "default": 0}, "stderr_offset": {"type": "integer", "minimum": 0, "default": 0}, "max_bytes": {"type": "integer", "minimum": 1000, "maximum": 2097152, "default": 131072}}, ["job_id"])},
+    {"name": "delete_job", "description": "Delete durable stdout/stderr/state for a finished job.", "inputSchema": _session_schema({"job_id": {"type": "string", "pattern": "^j_[a-f0-9]{16}$"}}, ["job_id"])},
+    {"name": "cleanup_jobs", "description": "Preview or delete old completed job logs. Defaults to dry-run.", "inputSchema": _obj({"session_id": {"anyOf": [{"type": "string", "pattern": "^s_[a-f0-9]{16}$"}, {"type": "null"}], "default": None}, "older_than_seconds": {"type": "integer", "minimum": 0, "maximum": 31536000, "default": 604800}, "keep_recent_per_session": {"type": "integer", "minimum": 0, "maximum": 10000, "default": 20}, "max_delete": {"type": "integer", "minimum": 1, "maximum": 100000, "default": 10000}, "dry_run": {"type": "boolean", "default": True}})},
     {"name": "terminate_job", "description": "Stop a running command job on a computer.", "inputSchema": _session_schema({"job_id": {"type": "string"}, "signal": {"type": "string", "enum": ["TERM", "INT", "KILL", "HUP"], "default": "TERM"}, "force_after_seconds": {"type": "integer", "minimum": 0, "maximum": 60, "default": 5}}, ["job_id"])},
     {"name": "search_project", "description": "Search text below a repository/path on a selected computer.", "inputSchema": _session_schema({"query": {"type": "string"}, "repo": {"type": "string", "default": "."}, "path": {"type": "string", "default": "."}, "glob": {"type": ["array", "null"], "items": {"type": "string"}}, "fixed_strings": {"type": "boolean", "default": False}, "max_results": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 500}}, ["query"])},
+    {"name": "search_many", "description": "Run multiple independent ripgrep searches in one MCP round trip.", "inputSchema": _obj({"searches": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "object", "properties": {"session_id": {"type": "string", "pattern": "^s_[a-f0-9]{16}$"}, "query": {"type": "string", "minLength": 1, "maxLength": 100000}, "repo": {"type": "string", "default": ".", "maxLength": 4000}, "path": {"type": "string", "default": ".", "maxLength": 8000}, "glob": {"type": "array", "items": {"type": "string"}, "maxItems": 100}, "fixed_strings": {"type": "boolean", "default": False}, "max_results": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 500}}, "required": ["session_id", "query"]}}, "concurrency": {"type": "integer", "minimum": 1, "maximum": 16, "default": 8}}, ["searches"])},
     {"name": "read_file", "description": "Read a line-numbered text chunk from a selected computer.", "inputSchema": _session_schema({"path": {"type": "string"}, "repo": {"type": "string", "default": "."}, "start_line": {"type": "integer", "minimum": 1, "default": 1}, "max_lines": {"type": "integer", "minimum": 1, "maximum": 20000, "default": 1000}}, ["path"])},
+    {"name": "read_files", "description": "Read multiple file chunks concurrently in one MCP round trip.", "inputSchema": _obj({"files": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "properties": {"session_id": {"type": "string", "pattern": "^s_[a-f0-9]{16}$"}, "path": {"type": "string", "minLength": 1, "maxLength": 8000}, "repo": {"type": "string", "default": ".", "maxLength": 4000}, "start_line": {"type": "integer", "minimum": 1, "default": 1}, "max_lines": {"type": "integer", "minimum": 1, "maximum": 20000, "default": 1000}}, "required": ["session_id", "path"]}}, "concurrency": {"type": "integer", "minimum": 1, "maximum": 32, "default": 16}}, ["files"])},
     {"name": "write_file", "description": "Create or replace a text file on a selected computer.", "inputSchema": _session_schema({"path": {"type": "string"}, "content": {"type": "string"}, "repo": {"type": "string", "default": "."}, "create_parents": {"type": "boolean", "default": True}, "overwrite": {"type": "boolean", "default": True}}, ["path", "content"])},
     {"name": "replace_text", "description": "Replace exact text in a file on a selected computer.", "inputSchema": _session_schema({"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}, "repo": {"type": "string", "default": "."}, "expected_occurrences": {"type": ["integer", "null"]}}, ["path", "old_text", "new_text"])},
-    {"name": "read_binary_file", "description": "Read a binary file from a selected computer as base64 transfer data.", "inputSchema": _session_schema({"path": {"type": "string"}, "repo": {"type": "string", "default": "."}, "max_bytes": {"type": "integer", "minimum": 1, "maximum": 16777216, "default": 16777216}}, ["path"])},
-    {"name": "write_binary_file", "description": "Write raw bytes supplied as base64 to a selected computer.", "inputSchema": _session_schema({"path": {"type": "string"}, "content_base64": {"type": "string"}, "repo": {"type": "string", "default": "."}, "create_parents": {"type": "boolean", "default": True}, "overwrite": {"type": "boolean", "default": True}}, ["path", "content_base64"])},
+    {"name": "apply_patch", "description": "Validate or apply a unified Git patch at an explicit repository root.", "inputSchema": _session_schema({"patch": {"type": "string", "minLength": 1, "maxLength": 8388608}, "repo": {"type": "string", "default": "."}, "check_only": {"type": "boolean", "default": False}}, ["patch"])},
+    {"name": "git_status_diff", "description": "Return Git state under one total response budget; optionally suppress diffs/untracked data or filter paths.", "inputSchema": _session_schema({"repo": {"type": "string", "default": "."}, "max_total_chars": {"type": "integer", "minimum": 1000, "maximum": 2000000, "default": 200000}, "include_untracked": {"type": "boolean", "default": True}, "include_diff": {"type": "boolean", "default": True}, "paths": {"type": "array", "items": {"type": "string"}, "maxItems": 200, "default": []}})},
+    {"name": "read_binary_file", "description": "Return a repository file as a native MCP embedded binary resource.", "inputSchema": _session_schema({"path": {"type": "string", "minLength": 1, "maxLength": 8000}, "repo": {"type": "string", "default": "."}, "max_bytes": {"type": "integer", "minimum": 1, "maximum": 16777216, "default": 16777216}}, ["path"])},
+    {"name": "view_image", "description": "Read an image from the host and return native MCP ImageContent.", "inputSchema": _session_schema({"path": {"type": "string", "minLength": 1, "maxLength": 8000}, "repo": {"type": "string", "default": "."}, "max_bytes": {"type": "integer", "minimum": 1, "maximum": 16777216, "default": 16777216}}, ["path"])},
+    {"name": "write_binary_file", "description": "Write raw bytes supplied as base64 to a selected computer.", "inputSchema": _session_schema({"path": {"type": "string", "minLength": 1, "maxLength": 8000}, "content_base64": {"type": "string", "minLength": 1, "maxLength": 22500000}, "repo": {"type": "string", "default": "."}, "create_parents": {"type": "boolean", "default": True}, "overwrite": {"type": "boolean", "default": True}}, ["path", "content_base64"])},
     {"name": "list_processes", "description": "List processes on the selected computer.", "inputSchema": _session_schema({"max_processes": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 500}})},
     {"name": "signal_process", "description": "Signal a process on the selected computer.", "inputSchema": _session_schema({"pid": {"type": "integer", "minimum": 2}, "signal": {"type": "string", "enum": ["TERM", "INT", "KILL", "HUP", "CONT", "STOP"], "default": "TERM"}}, ["pid"])},
+    {"name": "read_terminal", "description": "Read tmux state for interactive programs. Prefer exec_command for normal commands.", "inputSchema": _session_schema({"cursor": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}], "default": None}, "max_bytes": {"type": "integer", "minimum": 1000, "maximum": 2097152, "default": 131072}, "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 25, "default": 0}, "screen_lines": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 200}})},
+    {"name": "send_terminal_input", "description": "Type into the persistent tmux terminal. Use only for genuinely interactive programs.", "inputSchema": _session_schema({"text": {"type": "string", "minLength": 1, "maxLength": 1000000}, "press_enter": {"type": "boolean", "default": True}}, ["text"])},
+    {"name": "send_terminal_key", "description": "Send a control/navigation key to the persistent interactive terminal.", "inputSchema": _session_schema({"key": {"type": "string", "enum": ["C-c", "C-d", "C-z", "Enter", "Tab", "Escape", "Up", "Down", "Left", "Right", "BSpace"]}}, ["key"])},
 ]
 
 _decorate_router_tools(ROUTER_TOOLS)
@@ -250,6 +273,48 @@ class RouterMCP:
         if path == ".": return repo
         return str(Path(repo) / path)
 
+    @staticmethod
+    def _batch_results(items: list[dict[str, Any]], fn: Any, concurrency: int) -> dict[str, Any]:
+        def run(index_item: tuple[int, dict[str, Any]]) -> dict[str, Any]:
+            index, item = index_item
+            try:
+                return {"index": index, "ok": True, "http_status": 200, "result": fn(dict(item)), "error": None}
+            except Exception as exc:
+                return {"index": index, "ok": False, "http_status": 500, "result": None, "error": f"{type(exc).__name__}: {exc}"}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+            rows = list(pool.map(run, enumerate(items)))
+        return {"results": rows, "count": len(rows)}
+
+    @staticmethod
+    def _structured_search(raw: dict[str, Any], *, session_id: str, repo: str, query: str, target: str) -> dict[str, Any]:
+        matches = []
+        root_text = str(raw.get("root") or "")
+        for row in raw.get("results", []):
+            text = str(row)
+            parts = text.split(":", 3)
+            if len(parts) < 4:
+                continue
+            raw_path, line, column, body = parts
+            path = raw_path
+            if root_text and path.startswith(root_text.rstrip("/") + "/"):
+                rel = path[len(root_text.rstrip("/"))+1:]
+                path = str(Path(target) / rel) if target not in {"", "."} else rel
+            if repo not in {"", "."} and path.startswith(repo.rstrip("/") + "/"):
+                path = path[len(repo.rstrip("/"))+1:]
+            try:
+                line_i = int(line); col_i = int(column)
+            except ValueError:
+                continue
+            matches.append({"path": path, "line": line_i, "column": col_i, "text": body})
+        return {
+            "session_id": session_id, "repo": repo, "query": query,
+            "match_count_returned": len(matches), "truncated": bool(raw.get("truncated", False)), "matches": matches,
+        }
+
+    @staticmethod
+    def _resource_uri(sid: str, target: str) -> str:
+        return f"host-sandbox://{sid}/{quote(target.lstrip('/'), safe='/')}"
+
     def call(self, name: str, a: dict[str, Any]) -> Any:
         if name == "sandbox_health":
             return {"ok": True, "router": "host-sandbox", **self.router.list_hosts()}
@@ -270,6 +335,33 @@ class RouterMCP:
             s = self._session(str(a["session_id"])); s.running = False
             with self._lock: self._save()
             return {"id": s.id, "project": s.project, "running": False}
+        if name == "cleanup_jobs":
+            sid_value = a.get("session_id")
+            args = {
+                "older_than_seconds": a.get("older_than_seconds", 604800),
+                "keep_recent": a.get("keep_recent_per_session", 20),
+                "max_delete": a.get("max_delete", 10000),
+                "dry_run": a.get("dry_run", True),
+            }
+            if sid_value:
+                return self._remote(str(sid_value), "cleanup_jobs", args)
+            projects = [entry["id"] for entry in self.router.project_entries()]
+            rows = []
+            for project in projects:
+                try:
+                    result = self._payload(self.router.call_tool(project, "cleanup_jobs", args))
+                    rows.append({"project": project, "ok": True, "result": result})
+                except Exception as exc:
+                    rows.append({"project": project, "ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            return {"results": rows, "count": len(rows), "dry_run": bool(args["dry_run"])}
+        if name == "search_many":
+            items = list(a.get("searches") or [])
+            if len(items) > 16: raise ValueError("at most 16 searches are allowed")
+            return self._batch_results(items, lambda item: self.call("search_project", item), max(1, min(16, int(a.get("concurrency", 8)))))
+        if name == "read_files":
+            items = list(a.get("files") or [])
+            if len(items) > 32: raise ValueError("at most 32 files are allowed")
+            return self._batch_results(items, lambda item: self.call("read_file", item), max(1, min(32, int(a.get("concurrency", 16)))))
         if name == "exec_commands":
             commands = list(a.get("commands") or [])
             if not commands:
@@ -297,14 +389,11 @@ class RouterMCP:
         if name == "list_jobs":
             return self._remote(sid, "list_jobs", {"limit": a.get("limit", 50)})
         if name == "get_job":
-            # Current host agent has a single combined output stream. Expose it as stdout until
-            # the host job backend reaches exact stdout/stderr parity.
-            r = self._remote(sid, "read_job", {"job_id": a["job_id"], "offset": a.get("stdout_offset", 0), "max_bytes": a.get("max_bytes", 131072)})
-            out = r.pop("output", "")
-            r.update({"stdout": out, "stderr": "", "stdout_offset": a.get("stdout_offset", 0), "stdout_next_offset": r.pop("next_offset", 0), "stderr_offset": a.get("stderr_offset", 0), "stderr_next_offset": a.get("stderr_offset", 0)})
-            return r
+            return self._remote(sid, "read_job", {"job_id": a["job_id"], "stdout_offset": a.get("stdout_offset", 0), "stderr_offset": a.get("stderr_offset", 0), "max_bytes": a.get("max_bytes", 131072)})
+        if name == "delete_job":
+            return self._remote(sid, "delete_job", {"job_id": a["job_id"]})
         if name == "terminate_job":
-            return self._remote(sid, "signal_job", {"job_id": a["job_id"], "sig": a.get("signal", "TERM")})
+            return self._remote(sid, "signal_job", {"job_id": a["job_id"], "sig": a.get("signal", "TERM"), "force_after_seconds": a.get("force_after_seconds", 5)})
         if name == "path_info":
             target = self._join(a.get("repo", "."), a.get("path", "."))
             info = self._remote(sid, "path_info", {"path": target})
@@ -317,16 +406,15 @@ class RouterMCP:
             rows = [x for x in r.get("output_tail", "").splitlines() if x]
             return {"repositories": [{"path": x[2:] if x.startswith("./") else x, "name": Path(x).name} for x in rows], "truncated": len(rows) >= a.get("limit",1000)}
         if name == "search_project":
-            target = self._join(a.get("repo", "."), a.get("path", "."))
-            # Underlying search_text doesn't yet expose glob filtering.
-            return self._remote(sid, "search_text", {"query": a["query"], "path": target, "max_results": a.get("max_results",500), "fixed_strings": a.get("fixed_strings",False)})
+            repo = a.get("repo", "."); rel_path = a.get("path", ".")
+            target = self._join(repo, rel_path)
+            raw = self._remote(sid, "search_text", {"query": a["query"], "path": target, "max_results": a.get("max_results",500), "fixed_strings": a.get("fixed_strings",False), "glob": a.get("glob")})
+            return self._structured_search(raw, session_id=sid, repo=repo, query=a["query"], target=rel_path)
         if name == "read_file":
-            target = self._join(a.get("repo", "."), a["path"])
-            raw = self._remote(sid, "read_file", {"path": target, "offset": 0, "max_bytes": 1048576})
-            lines = raw.get("text", "").splitlines()
-            start = a.get("start_line",1); max_lines = a.get("max_lines",1000); end = min(len(lines), start-1+max_lines)
-            content = "\n".join(f"{i+1}: {lines[i]}" for i in range(start-1,end))
-            return {"path": target, "start_line": start, "end_line": end, "total_lines": len(lines), "has_more": end < len(lines), "eof": end >= len(lines), "next_start_line": end+1 if end < len(lines) else None, "content": content}
+            repo = a.get("repo", "."); target = self._join(repo, a["path"])
+            raw = self._remote(sid, "read_text_lines", {"path": target, "start_line": a.get("start_line",1), "max_lines": a.get("max_lines",1000)})
+            raw["repo"] = repo; raw["path"] = a["path"]
+            return raw
         if name == "write_file":
             target = self._join(a.get("repo", "."), a["path"])
             mode = "overwrite" if a.get("overwrite",True) else "exclusive"
@@ -334,19 +422,42 @@ class RouterMCP:
         if name == "replace_text":
             target = self._join(a.get("repo", "."), a["path"])
             return self._remote(sid, "replace_text", {"path": target, "old": a["old_text"], "new": a["new_text"], "expected_matches": a.get("expected_occurrences")})
+        if name == "apply_patch":
+            return self._remote(sid, "apply_patch", {"repo": a.get("repo", "."), "patch": a["patch"], "check_only": a.get("check_only", False)})
+        if name == "git_status_diff":
+            raw = self._remote(sid, "git_status_diff", {"repo": a.get("repo", "."), "max_total_chars": a.get("max_total_chars",200000), "include_untracked": a.get("include_untracked",True), "include_diff": a.get("include_diff",True), "paths": a.get("paths",[])})
+            raw.update({"session_id": sid, "repo": a.get("repo", "."), "repository_root": raw.pop("repo", None), "paths": a.get("paths",[])})
+            returned = sum(len(str(raw.get(k, ""))) for k in ("status","diff","staged_diff","untracked","whitespace_errors"))
+            raw["returned_chars"] = returned
+            raw.setdefault("truncated_sections", [])
+            raw.setdefault("status_truncated", "status" in raw["truncated_sections"])
+            return raw
         if name == "read_binary_file":
             target = self._join(a.get("repo", "."), a["path"])
-            return self._remote(sid, "read_file_chunk", {"path": target, "offset": 0, "length": min(a.get("max_bytes",16777216),1048576)})
+            raw = self._remote(sid, "read_binary_file", {"path": target, "max_bytes": a.get("max_bytes",16777216)})
+            raw.update({"repo": a.get("repo", "."), "path": a["path"], "uri": self._resource_uri(sid, target)})
+            return raw
+        if name == "view_image":
+            target = self._join(a.get("repo", "."), a["path"])
+            raw = self._remote(sid, "view_image", {"path": target, "max_bytes": a.get("max_bytes",16777216)})
+            raw.update({"repo": a.get("repo", "."), "path": a["path"], "uri": self._resource_uri(sid, target)})
+            return raw
         if name == "write_binary_file":
             target = self._join(a.get("repo", "."), a["path"])
-            if not a.get("overwrite",True):
-                try: self._remote(sid, "path_info", {"path": target}); raise FileExistsError(target)
-                except Exception: pass
-            return self._remote(sid, "write_file_chunk", {"path": target, "data_base64": a["content_base64"], "offset": 0, "create_parents": a.get("create_parents",True), "truncate_after": True, "final_sha256": True})
+            return self._remote(sid, "write_binary_file", {"path": target, "content_base64": a["content_base64"], "create_parents": a.get("create_parents",True), "overwrite": a.get("overwrite",True)})
         if name == "list_processes":
             return self._remote(sid, "list_processes", {"max_processes": a.get("max_processes",500)})
         if name == "signal_process":
             return self._remote(sid, "signal_process", {"pid": a["pid"], "sig": a.get("signal","TERM")})
+        if name == "read_terminal":
+            raw = self._remote(sid, "read_terminal", {"terminal_id": sid, "cursor": a.get("cursor"), "max_bytes": a.get("max_bytes",131072), "wait_seconds": a.get("wait_seconds",0), "screen_lines": a.get("screen_lines",200)})
+            raw["session_id"] = sid; raw.pop("terminal_id", None); return raw
+        if name == "send_terminal_input":
+            raw = self._remote(sid, "send_terminal_input", {"terminal_id": sid, "text": a["text"], "press_enter": a.get("press_enter",True)})
+            raw["session_id"] = sid; raw.pop("terminal_id", None); return raw
+        if name == "send_terminal_key":
+            raw = self._remote(sid, "send_terminal_key", {"terminal_id": sid, "key": a["key"]})
+            raw["session_id"] = sid; raw.pop("terminal_id", None); return raw
         raise KeyError(f"unknown router tool: {name}")
 
     @staticmethod
@@ -394,7 +505,23 @@ class RouterMCP:
                 name = params.get("name"); arguments = dict(params.get("arguments") or {})
                 try:
                     payload = self.call(str(name), arguments)
-                    body = {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, default=str, indent=2)}], "structuredContent": payload, "isError": False}
+                    if name == "read_binary_file":
+                        data = str(payload.pop("content_base64"))
+                        uri = str(payload.get("uri"))
+                        mime = str(payload.get("mime_type") or "application/octet-stream")
+                        body = {
+                            "content": [{"type": "resource", "resource": {"uri": uri, "mimeType": mime, "blob": data}}],
+                            "structuredContent": payload, "isError": False,
+                        }
+                    elif name == "view_image":
+                        data = str(payload.pop("content_base64"))
+                        mime = str(payload.get("mime_type") or "image/png")
+                        body = {
+                            "content": [{"type": "image", "data": data, "mimeType": mime}],
+                            "structuredContent": payload, "isError": False,
+                        }
+                    else:
+                        body = {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, default=str, indent=2)}], "structuredContent": payload, "isError": False}
                 except Exception as exc:
                     body = {"content": [{"type": "text", "text": f"{type(exc).__name__}: {exc}"}], "isError": True}
                 result = self._modern_result(body) if self._is_modern(params, protocol_version) else body

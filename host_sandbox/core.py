@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .audit import AuditLog
+from .parity import ParityHostToolsMixin
 
 
 def _clamp(value: int, low: int, high: int) -> int:
@@ -41,8 +42,10 @@ class Job:
     started_at: float
     timeout_seconds: int
     process: subprocess.Popen[bytes]
-    log_path: Path
-    log_file: Any = field(repr=False)
+    stdout_path: Path
+    stderr_path: Path
+    stdout_file: Any = field(repr=False)
+    stderr_file: Any = field(repr=False)
     timed_out: bool = False
     timeout_timer: threading.Timer | None = field(default=None, repr=False)
 
@@ -55,7 +58,7 @@ class Job:
         return "finished" if rc == 0 else "failed"
 
 
-class HostTools:
+class HostTools(ParityHostToolsMixin):
     """Intentionally unrestricted host tools. Paths are not sandboxed."""
 
     def __init__(self, audit: AuditLog, state_dir: Path, cwd: str | None = None) -> None:
@@ -320,7 +323,7 @@ class HostTools:
                     break
         return {"root": str(root), "pattern": pattern, "results": results, "truncated": len(results) >= limit}
 
-    def search_text(self, query: str, path: str = ".", max_results: int = 200, fixed_strings: bool = False) -> dict[str, Any]:
+    def search_text(self, query: str, path: str = ".", max_results: int = 200, fixed_strings: bool = False, glob: list[str] | None = None) -> dict[str, Any]:
         root = self._path(path)
         limit = _clamp(max_results, 1, 2000)
         rg = shutil.which("rg")
@@ -328,6 +331,8 @@ class HostTools:
             args = [rg, "--line-number", "--column", "--no-heading", "--color", "never", "--hidden", "--glob", "!.git/**"]
             if fixed_strings:
                 args.append("--fixed-strings")
+            for pattern in glob or []:
+                args.extend(["--glob", str(pattern)])
             args.extend([query, str(root)])
             proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             results: list[str] = []
@@ -341,7 +346,12 @@ class HostTools:
             try:
                 proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                proc.kill(); proc.wait(timeout=2)
+            finally:
+                if proc.stdout is not None:
+                    proc.stdout.close()
+                if proc.stderr is not None:
+                    proc.stderr.close()
             rc = proc.returncode
             if rc not in {0, 1, -15} and not (rc is None and results):
                 raise RuntimeError(stderr.strip() or f"rg failed with exit code {rc}")
@@ -351,6 +361,13 @@ class HostTools:
         paths = [root] if root.is_file() else (Path(dp) / n for dp, _, files in os.walk(root) for n in files)
         needle = query if fixed_strings else query
         for file_path in paths:
+            if glob:
+                try:
+                    rel = str(file_path.relative_to(root)) if root.is_dir() else file_path.name
+                except ValueError:
+                    rel = str(file_path)
+                if not any(fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(file_path.name, pattern) for pattern in glob):
+                    continue
             try:
                 with file_path.open("r", encoding="utf-8", errors="ignore") as f:
                     for line_no, line in enumerate(f, 1):
@@ -384,17 +401,42 @@ class HostTools:
             except ProcessLookupError:
                 pass
 
+    @staticmethod
+    def _read_stream(path: Path, offset: int, limit: int) -> tuple[str, int, int, bool]:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return "", offset, 0, False
+        offset = max(0, min(int(offset), size))
+        with path.open("rb") as f:
+            f.seek(offset)
+            data = f.read(max(0, limit))
+        next_offset = offset + len(data)
+        return _decode_output(data), next_offset, size, next_offset < size
+
+    @staticmethod
+    def _close_job_streams(job: Job) -> None:
+        for stream in (job.stdout_file, job.stderr_file):
+            try:
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+
     def _job_dict(self, job: Job, output_bytes: int = 65536) -> dict[str, Any]:
         rc = job.process.poll()
-        try:
-            size = job.log_path.stat().st_size
-            with job.log_path.open("rb") as f:
-                if size > output_bytes:
-                    f.seek(size - output_bytes)
-                output = _decode_output(f.read())
-        except OSError:
-            size = 0
-            output = ""
+        if rc is not None:
+            self._close_job_streams(job)
+        budget = max(0, int(output_bytes))
+        stdout, stdout_next, stdout_size, stdout_more = self._read_stream(job.stdout_path, 0, budget)
+        used = len(stdout.encode("utf-8", errors="replace"))
+        stderr_budget = max(0, budget - used)
+        stderr, stderr_next, stderr_size, stderr_more = self._read_stream(job.stderr_path, 0, stderr_budget)
+        returned = len(stdout.encode("utf-8", errors="replace")) + len(stderr.encode("utf-8", errors="replace"))
+        duration = max(0.0, time.time() - job.started_at)
         return {
             "id": job.id,
             "command": job.command,
@@ -403,10 +445,24 @@ class HostTools:
             "status": job.status(),
             "exit_code": rc,
             "started_at": job.started_at,
-            "duration_seconds": max(0.0, time.time() - job.started_at),
+            "duration_seconds": duration,
+            "duration_ms": round(duration * 1000, 3),
             "timeout_seconds": job.timeout_seconds,
-            "output_size": size,
-            "output_tail": output,
+            "stdout": stdout,
+            "stderr": stderr,
+            "stdout_offset": 0,
+            "stdout_next_offset": stdout_next,
+            "stdout_more": stdout_more,
+            "stdout_size": stdout_size,
+            "stderr_offset": 0,
+            "stderr_next_offset": stderr_next,
+            "stderr_more": stderr_more,
+            "stderr_size": stderr_size,
+            "max_output_bytes_total": budget,
+            "returned_output_bytes": returned,
+            # Temporary backwards compatibility for pre-0.5 router/client code.
+            "output_tail": stdout + stderr,
+            "output_size": stdout_size + stderr_size,
         }
 
     def exec_command(
@@ -423,8 +479,10 @@ class HostTools:
         wait_seconds = _clamp(wait_seconds, 0, 20)
         max_output_bytes = _clamp(max_output_bytes, 1000, 2_097_152)
         job_id = "j_" + uuid.uuid4().hex[:16]
-        log_path = self.jobs_dir / f"{job_id}.log"
-        log_file = log_path.open("wb")
+        stdout_path = self.jobs_dir / f"{job_id}.stdout"
+        stderr_path = self.jobs_dir / f"{job_id}.stderr"
+        stdout_file = stdout_path.open("wb")
+        stderr_file = stderr_path.open("wb")
         child_env = os.environ.copy()
         if env:
             child_env.update({str(k): str(v) for k, v in env.items()})
@@ -436,32 +494,22 @@ class HostTools:
         else:
             argv = command
         proc = subprocess.Popen(
-            argv,
-            cwd=run_cwd,
-            env=child_env,
-            stdin=subprocess.DEVNULL,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            start_new_session=(os.name == "posix"),
+            argv, cwd=run_cwd, env=child_env, stdin=subprocess.DEVNULL,
+            stdout=stdout_file, stderr=stderr_file, start_new_session=(os.name == "posix"),
             shell=(os.name != "posix"),
         )
-        job = Job(job_id, command, run_cwd, time.time(), timeout_seconds, proc, log_path, log_file)
+        job = Job(job_id, command, run_cwd, time.time(), timeout_seconds, proc, stdout_path, stderr_path, stdout_file, stderr_file)
         with self._jobs_lock:
             self._jobs[job_id] = job
         timer = threading.Timer(timeout_seconds, self._kill_job, args=(job, True))
-        timer.daemon = True
-        job.timeout_timer = timer
-        timer.start()
-
+        timer.daemon = True; job.timeout_timer = timer; timer.start()
         if wait_seconds > 0:
             try:
                 proc.wait(timeout=wait_seconds)
             except subprocess.TimeoutExpired:
                 pass
         if proc.poll() is not None:
-            timer.cancel()
-            log_file.flush()
-            log_file.close()
+            timer.cancel(); self._close_job_streams(job)
         return self._job_dict(job, max_output_bytes)
 
     def exec_commands(self, commands: list[dict[str, Any]], concurrency: int = 8) -> dict[str, Any]:
@@ -470,39 +518,76 @@ class HostTools:
         if len(commands) > 32:
             raise ValueError("at most 32 commands are allowed")
         concurrency = _clamp(concurrency, 1, 16)
-
-        def run(item: dict[str, Any]) -> dict[str, Any]:
-            return self.exec_command(**item)
-
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futures = [pool.submit(run, item) for item in commands]
+            futures = [pool.submit(self.exec_command, **item) for item in commands]
             return {"results": [future.result() for future in futures]}
 
     def list_jobs(self, limit: int = 100) -> dict[str, Any]:
         with self._jobs_lock:
-            jobs = sorted(self._jobs.values(), key=lambda j: j.started_at, reverse=True)[: _clamp(limit, 1, 1000)]
+            jobs = sorted(self._jobs.values(), key=lambda j: j.started_at, reverse=True)[: _clamp(limit, 1, 10000)]
         return {"jobs": [self._job_dict(job, 8192) for job in jobs]}
 
-    def read_job(self, job_id: str, offset: int = 0, max_bytes: int = 131072) -> dict[str, Any]:
+    def read_job(
+        self, job_id: str, stdout_offset: int = 0, stderr_offset: int = 0, max_bytes: int = 131072
+    ) -> dict[str, Any]:
         with self._jobs_lock:
             job = self._jobs.get(job_id)
         if not job:
             raise KeyError(f"unknown job: {job_id}")
-        offset = max(0, int(offset))
-        max_bytes = _clamp(max_bytes, 1, 2_097_152)
-        try:
-            job.log_file.flush()
-        except (ValueError, OSError):
-            pass
-        size = job.log_path.stat().st_size
-        with job.log_path.open("rb") as f:
-            f.seek(offset)
-            data = f.read(max_bytes)
+        for stream in (job.stdout_file, job.stderr_file):
+            try: stream.flush()
+            except (OSError, ValueError): pass
+        budget = _clamp(max_bytes, 1000, 2_097_152)
+        stdout, stdout_next, stdout_size, stdout_more = self._read_stream(job.stdout_path, stdout_offset, budget)
+        used = len(stdout.encode("utf-8", errors="replace"))
+        stderr, stderr_next, stderr_size, stderr_more = self._read_stream(job.stderr_path, stderr_offset, max(0, budget-used))
         info = self._job_dict(job, 0)
-        info.update({"offset": offset, "next_offset": offset + len(data), "eof": offset + len(data) >= size, "output": _decode_output(data)})
+        info.update({
+            "stdout": stdout, "stderr": stderr,
+            "stdout_offset": max(0, int(stdout_offset)), "stdout_next_offset": stdout_next, "stdout_more": stdout_more, "stdout_size": stdout_size,
+            "stderr_offset": max(0, int(stderr_offset)), "stderr_next_offset": stderr_next, "stderr_more": stderr_more, "stderr_size": stderr_size,
+            "max_output_bytes_total": budget,
+            "returned_output_bytes": len(stdout.encode("utf-8", errors="replace")) + len(stderr.encode("utf-8", errors="replace")),
+            "output": stdout + stderr,
+        })
         return info
 
-    def signal_job(self, job_id: str, sig: str = "TERM") -> dict[str, Any]:
+    def delete_job(self, job_id: str) -> dict[str, Any]:
+        with self._jobs_lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                raise KeyError(f"unknown job: {job_id}")
+            if job.process.poll() is None:
+                raise RuntimeError("cannot delete a running job")
+            self._jobs.pop(job_id, None)
+        if job.timeout_timer:
+            job.timeout_timer.cancel()
+        self._close_job_streams(job)
+        deleted = []
+        for path in (job.stdout_path, job.stderr_path):
+            try: path.unlink(); deleted.append(str(path))
+            except FileNotFoundError: pass
+        return {"job_id": job_id, "deleted": True, "files": deleted}
+
+    def cleanup_jobs(
+        self, older_than_seconds: int = 604800, keep_recent: int = 20, max_delete: int = 10000, dry_run: bool = True
+    ) -> dict[str, Any]:
+        age = _clamp(older_than_seconds, 0, 31_536_000)
+        keep = _clamp(keep_recent, 0, 10000)
+        cap = _clamp(max_delete, 1, 100000)
+        now = time.time()
+        with self._jobs_lock:
+            finished = [j for j in self._jobs.values() if j.process.poll() is not None]
+            finished.sort(key=lambda j: j.started_at, reverse=True)
+            protected = {j.id for j in finished[:keep]}
+            candidates = [j for j in finished if j.id not in protected and now-j.started_at >= age][:cap]
+        rows = [{"job_id": j.id, "started_at": j.started_at, "age_seconds": round(now-j.started_at,3)} for j in candidates]
+        if not dry_run:
+            for j in candidates:
+                self.delete_job(j.id)
+        return {"dry_run": bool(dry_run), "candidate_count": len(rows), "deleted_count": 0 if dry_run else len(rows), "jobs": rows}
+
+    def signal_job(self, job_id: str, sig: str = "TERM", force_after_seconds: int = 5) -> dict[str, Any]:
         with self._jobs_lock:
             job = self._jobs.get(job_id)
         if not job:
@@ -512,10 +597,16 @@ class HostTools:
         signum = getattr(signal, f"SIG{sig.upper()}", None)
         if signum is None:
             raise ValueError("unsupported signal")
-        if os.name == "posix":
-            os.killpg(job.process.pid, signum)
-        else:
-            job.process.send_signal(signum)
+        if os.name == "posix": os.killpg(job.process.pid, signum)
+        else: job.process.send_signal(signum)
+        force = _clamp(force_after_seconds, 0, 60)
+        if force and sig.upper() != "KILL":
+            try: job.process.wait(timeout=force)
+            except subprocess.TimeoutExpired:
+                try:
+                    if os.name == "posix": os.killpg(job.process.pid, signal.SIGKILL)
+                    else: job.process.kill()
+                except ProcessLookupError: pass
         return self._job_dict(job)
 
     def list_processes(self, max_processes: int = 500) -> dict[str, Any]:
@@ -554,7 +645,4 @@ class HostTools:
         for job in jobs:
             if job.process.poll() is None:
                 self._kill_job(job)
-            try:
-                job.log_file.close()
-            except (OSError, ValueError):
-                pass
+            self._close_job_streams(job)

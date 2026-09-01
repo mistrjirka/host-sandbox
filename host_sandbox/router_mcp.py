@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import threading
@@ -250,6 +251,23 @@ class RouterMCP:
             s = self._session(str(a["session_id"])); s.running = False
             with self._lock: self._save()
             return {"id": s.id, "project": s.project, "running": False}
+        if name == "exec_commands":
+            commands = list(a.get("commands") or [])
+            if not commands:
+                return {"results": []}
+            if len(commands) > 32:
+                raise ValueError("at most 32 commands are allowed")
+            concurrency = max(1, min(32, int(a.get("concurrency", 16))))
+
+            def run_batch_item(raw: dict[str, Any]) -> Any:
+                item = dict(raw)
+                sid = str(item.pop("session_id"))
+                args = {k: item[k] for k in ("command", "cwd", "env", "timeout_seconds", "wait_seconds", "max_output_bytes") if k in item}
+                return self._remote(sid, "exec_command", args)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+                futures = [pool.submit(run_batch_item, item) for item in commands]
+                return {"results": [future.result() for future in futures]}
 
         sid = str(a.pop("session_id"))
         if name == "exec_command":

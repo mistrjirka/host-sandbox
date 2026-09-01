@@ -40,6 +40,22 @@ class RouterMCPTests(unittest.TestCase):
             w=m.call("write_file", {"session_id":sid,"repo":"repo","path":"x.txt","content":"abc"})
             self.assertEqual(router.calls[-1][2]["path"],"repo/x.txt")
             self.assertTrue((Path(td)/"sessions.json").exists())
+    def test_exec_commands_routes_per_item_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            router=FakeRouter(); m=RouterMCP(router, Path(td)/"sessions.json")
+            alpha=m.call("create_session", {"project":"alpha"})["id"]
+            beta=m.call("create_session", {"project":"beta"})["id"]
+            result=m.call("exec_commands", {
+                "commands": [
+                    {"session_id":alpha, "command":"printf alpha", "wait_seconds":2},
+                    {"session_id":beta, "command":"printf beta", "wait_seconds":2},
+                ],
+                "concurrency": 2,
+            })
+            self.assertEqual(len(result["results"]), 2)
+            exec_hosts=[host for host,name,_ in router.calls if name == "exec_command"]
+            self.assertEqual(set(exec_hosts), {"alpha", "beta"})
+
     def test_mcp_single_endpoint_surface(self):
         m=RouterMCP(FakeRouter())
         listed=m.handle({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}})

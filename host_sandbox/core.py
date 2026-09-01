@@ -428,8 +428,15 @@ class HostTools:
         child_env = os.environ.copy()
         if env:
             child_env.update({str(k): str(v) for k, v in env.items()})
+        if os.name == "posix":
+            shell_path = child_env.get("SHELL") or "/bin/bash"
+            if not (os.path.isabs(shell_path) and os.access(shell_path, os.X_OK)):
+                shell_path = "/bin/bash"
+            argv: Any = [shell_path, "-c", command]
+        else:
+            argv = command
         proc = subprocess.Popen(
-            ["/bin/bash", "-lc", command] if os.name == "posix" else command,
+            argv,
             cwd=run_cwd,
             env=child_env,
             stdin=subprocess.DEVNULL,

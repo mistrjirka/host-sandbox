@@ -3,6 +3,9 @@ Description=Host Sandbox multi-computer router
 Documentation=https://github.com/mistrjirka/host-sandbox
 
 [Service]
+LogsDirectory=host-sandbox
+StandardOutput=append:%h/.local/state/host-sandbox/router-service.log
+StandardError=append:%h/.local/state/host-sandbox/router-service.log
 Type=simple
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=-%h/.config/host-sandbox/router.env

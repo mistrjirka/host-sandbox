@@ -7,6 +7,9 @@ PartOf=host-sandbox-router.service
 StartLimitIntervalSec=0
 
 [Service]
+LogsDirectory=host-sandbox
+StandardOutput=append:%h/.local/state/host-sandbox/tunnel-service.log
+StandardError=append:%h/.local/state/host-sandbox/tunnel-service.log
 Type=simple
 EnvironmentFile=%h/.config/host-sandbox/tunnel.env
 ExecStart=%h/programy/tunnel-client/tunnel-client run --profile host-sandbox

@@ -24,5 +24,5 @@ case ":$PATH:" in
     fi
     ;;
 esac
-printf 'Local-only: host-sandbox --name "My Laptop" serve --open\n'
-printf 'LAN/VPN:    host-sandbox --name "hub" serve --bind 0.0.0.0 --token <secret>\n'
+printf 'Foreground client: host-sandbox connect\n'
+printf 'Standalone local server: host-sandbox serve --open\n'

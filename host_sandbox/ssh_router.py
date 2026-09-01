@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .agent_transport import AgentMCPClient, AgentRegistry
+
 
 @dataclass
 class HostConfig:
@@ -145,11 +147,36 @@ class RemoteMCP:
 
 
 class SSHRouter:
-    def __init__(self, config_path: str | Path) -> None:
+    def __init__(self, config_path: str | Path, agent_registry: AgentRegistry | None = None) -> None:
         self.config_path = Path(config_path).expanduser()
         self.hosts: dict[str, HostConfig] = {}
-        self.clients: dict[str, RemoteMCP] = {}
+        self.clients: dict[str, RemoteMCP | AgentMCPClient] = {}
+        self.agent_registry = agent_registry
         self.reload()
+
+    def attach_agent_registry(self, registry: AgentRegistry) -> None:
+        self.agent_registry = registry
+
+    def has_host(self, name: str) -> bool:
+        return name in self.hosts or bool(self.agent_registry and self.agent_registry.is_online(name))
+
+    def project_entries(self) -> list[dict[str, Any]]:
+        entries: dict[str, dict[str, Any]] = {}
+        for h in self.hosts.values():
+            entries[h.name] = {
+                "id": h.name, "name": h.name,
+                "description": "Local host OS" if h.local else f"Host OS via {h.ssh}",
+                "transport": "local" if h.local else "ssh",
+            }
+        if self.agent_registry:
+            for agent in self.agent_registry.list_agents():
+                entries[agent["name"]] = {
+                    "id": agent["name"], "name": agent["name"],
+                    "description": "Foreground connected host agent",
+                    "transport": "outbound-agent",
+                    "online": True,
+                }
+        return [entries[name] for name in sorted(entries)]
 
     def reload(self) -> None:
         raw = json.loads(self.config_path.read_text(encoding="utf-8"))
@@ -180,27 +207,40 @@ class SSHRouter:
                 self.clients.pop(name).close()
 
     def list_hosts(self) -> dict[str, Any]:
-        values = []
+        values: dict[str, dict[str, Any]] = {}
         for h in self.hosts.values():
             if h.local:
-                values.append({"name": h.name, "local": True, "online": True})
+                values[h.name] = {"name": h.name, "local": True, "online": True, "transport": "local"}
                 continue
-            values.append({
+            values[h.name] = {
                 "name": h.name, "ssh": h.ssh, "local": False,
-                "online": _ssh_online(h, 3), "wake_capable": bool(h.wol_mac),
-            })
-        return {"hosts": values}
+                "online": _ssh_online(h, 3), "wake_capable": bool(h.wol_mac), "transport": "ssh",
+            }
+        if self.agent_registry:
+            for agent in self.agent_registry.list_agents():
+                values[agent["name"]] = agent
+        return {"hosts": [values[name] for name in sorted(values)]}
 
     def wake_host(self, host: str, wait_seconds: int | None = None) -> dict[str, Any]:
         if host not in self.hosts:
             raise KeyError(f"unknown host: {host}")
         return wake_host(self.hosts[host], wait_seconds)
 
-    def client(self, host: str) -> RemoteMCP:
+    def client(self, host: str) -> RemoteMCP | AgentMCPClient:
+        if self.agent_registry and self.agent_registry.is_online(host):
+            c = self.clients.get(host)
+            if not isinstance(c, AgentMCPClient):
+                if c is not None:
+                    c.close()
+                c = AgentMCPClient(self.agent_registry, host)
+                self.clients[host] = c
+            return c
         if host not in self.hosts:
             raise KeyError(f"unknown host: {host}")
         c = self.clients.get(host)
-        if c is None:
+        if c is None or isinstance(c, AgentMCPClient):
+            if c is not None:
+                c.close()
             c = RemoteMCP(self.hosts[host])
             self.clients[host] = c
         return c

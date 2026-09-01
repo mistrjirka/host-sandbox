@@ -8,6 +8,8 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
+from . import __version__
+
 from .ssh_router import SSHRouter
 
 
@@ -100,7 +102,6 @@ _TOOL_TITLES = {
     "write_binary_file": "Write binary file",
     "list_processes": "List host processes",
     "signal_process": "Signal host process",
-    "wake_host": "Wake host",
 }
 
 _READ_ONLY_TOOLS = {
@@ -141,7 +142,6 @@ ROUTER_TOOLS: list[dict[str, Any]] = [
     {"name": "list_sessions", "description": "List logical host sessions. A session selects one computer but does not create a container.", "inputSchema": _obj({"active_only": {"type": "boolean", "default": False}})},
     {"name": "create_session", "description": "Create a logical session for a configured computer. No container is created; tools run directly on that host OS.", "inputSchema": _obj({"project": {"type": "string"}, "label": {"type": ["string", "null"], "maxLength": 100}}, ["project"])},
     {"name": "destroy_session", "description": "Remove a logical host session. Files and processes on the computer are not deleted.", "inputSchema": _obj({"session_id": {"type": "string"}}, ["session_id"])},
-    {"name": "wake_host", "description": "Wake a configured computer using Wake-on-LAN and optionally wait until SSH is reachable.", "inputSchema": _obj({"project": {"type": "string"}, "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 600, "default": 120}}, ["project"])},
     {"name": "path_info", "description": "Inspect a file or directory on the selected computer.", "inputSchema": _session_schema({"repo": {"type": "string", "default": "."}, "path": {"type": "string", "default": "."}, "include_hidden": {"type": "boolean", "default": True}, "max_entries": {"type": "integer", "minimum": 1, "maximum": 20000, "default": 2000}})},
     {"name": "list_repositories", "description": "Discover Git repositories below the selected computer's workspace root.", "inputSchema": _session_schema({"max_depth": {"type": "integer", "minimum": 1, "maximum": 8, "default": 3}, "limit": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 1000}})},
     {"name": "exec_command", "description": "Run an unrestricted command directly on the selected computer.", "inputSchema": _session_schema({"command": {"type": "string", "maxLength": 1000000}, "cwd": {"type": "string", "default": "."}, "env": {"type": ["object", "null"], "additionalProperties": {"type": "string"}}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 604800, "default": 3600}, "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 20, "default": 8}, "max_output_bytes": {"type": "integer", "minimum": 1000, "maximum": 2097152, "default": 131072}}, ["command"])},
@@ -209,8 +209,8 @@ class RouterMCP:
             s = self._sessions.get(sid)
         if not s or not s.running:
             raise KeyError(f"unknown or inactive session: {sid}")
-        if s.project not in self.router.hosts:
-            raise KeyError(f"session host is no longer configured: {s.project}")
+        if not self.router.has_host(s.project):
+            raise KeyError(f"session host is not connected/configured: {s.project}")
         return s
 
     @staticmethod
@@ -234,20 +234,15 @@ class RouterMCP:
         if name == "sandbox_health":
             return {"ok": True, "router": "host-sandbox", **self.router.list_hosts()}
         if name == "list_projects":
-            return {"projects": [{"id": h.name, "name": h.name, "description": "Local host OS" if h.local else f"Host OS via {h.ssh}"} for h in self.router.hosts.values()]}
+            return {"projects": self.router.project_entries()}
         if name == "list_sessions":
             active_only = bool(a.get("active_only", False))
             with self._lock:
                 rows = [asdict(s) for s in self._sessions.values() if not active_only or s.running]
             return {"sessions": rows}
-        if name == "wake_host":
-            project = str(a["project"])
-            if project not in self.router.hosts:
-                raise KeyError(f"unknown project/host: {project}")
-            return self.router.wake_host(project, int(a.get("wait_seconds", 120)))
         if name == "create_session":
             project = str(a["project"])
-            if project not in self.router.hosts: raise KeyError(f"unknown project/host: {project}")
+            if not self.router.has_host(project): raise KeyError(f"unknown or disconnected project/host: {project}")
             now = time.time(); s = LogicalSession(self._sid(project, now), project, a.get("label"), now)
             with self._lock: self._sessions[s.id] = s; self._save()
             return {"id": s.id, "project": project, "label": s.label, "running": True, "container": None, "host_mode": True}
@@ -317,7 +312,7 @@ class RouterMCP:
 
     @staticmethod
     def _server_meta() -> dict[str, Any]:
-        return {"io.modelcontextprotocol/serverInfo": {"name": "host-sandbox-router", "version": "0.3.0"}}
+        return {"io.modelcontextprotocol/serverInfo": {"name": "host-sandbox-router", "version": __version__}}
 
     @classmethod
     def _modern_result(cls, payload: dict[str, Any], *, cacheable: bool = False) -> dict[str, Any]:
@@ -350,7 +345,7 @@ class RouterMCP:
             elif method == "initialize":
                 requested = str(params.get("protocolVersion") or "2025-11-25")
                 negotiated = requested if requested in {"2025-06-18", "2025-11-25"} else "2025-11-25"
-                result = {"protocolVersion": negotiated, "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "host-sandbox-router", "version": "0.3.0"}, "instructions": "Multiple computers exposed through Development-Sandbox-style logical sessions. Tools execute directly on host OSes."}
+                result = {"protocolVersion": negotiated, "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "host-sandbox-router", "version": __version__}, "instructions": "Multiple computers exposed through Development-Sandbox-style logical sessions. Tools execute directly on host OSes."}
             elif method == "ping":
                 result = self._modern_result({}) if self._is_modern(params, protocol_version) else {}
             elif method == "tools/list":

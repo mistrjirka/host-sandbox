@@ -23,7 +23,18 @@ if [[ ! -f "$CONFIG_DIR/router.env" ]]; then
   cat > "$CONFIG_DIR/router.env" <<'ENV'
 HOST_SANDBOX_ROUTER_BIND=127.0.0.1
 HOST_SANDBOX_ROUTER_PORT=8766
+HOST_SANDBOX_AGENT_BIND=0.0.0.0
+HOST_SANDBOX_AGENT_PORT=8767
 ENV
+  chmod 600 "$CONFIG_DIR/router.env"
+fi
+if ! grep -q '^HOST_SANDBOX_AGENT_TOKEN=' "$CONFIG_DIR/router.env"; then
+  agent_token="$(python3 - <<'PYTOKEN'
+import secrets
+print(secrets.token_urlsafe(32))
+PYTOKEN
+)"
+  printf 'HOST_SANDBOX_AGENT_TOKEN=%s\n' "$agent_token" >> "$CONFIG_DIR/router.env"
   chmod 600 "$CONFIG_DIR/router.env"
 fi
 
@@ -65,6 +76,10 @@ echo "Status:"
 echo "  systemctl --user status host-sandbox-router host-sandbox-tunnel"
 echo "Logs:"
 echo "  journalctl --user -u host-sandbox-router -u host-sandbox-tunnel -f"
+echo
+echo "Foreground clients connect to port 8767 using the private token in:"
+echo "  $CONFIG_DIR/router.env"
+echo "Do not paste that token into ChatGPT."
 echo
 echo "For startup without an interactive login, enable lingering once:"
 echo "  sudo loginctl enable-linger $(id -un)"

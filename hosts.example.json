@@ -1,17 +1,5 @@
 {
   "hosts": [
-    {"name": "hub", "local": true},
-    {
-      "name": "rtx3090",
-      "ssh": "jirka@192.168.50.123",
-      "wake_on_lan": {
-        "mac": "AA:BB:CC:DD:EE:FF",
-        "broadcast": "192.168.50.255",
-        "port": 9,
-        "timeout_seconds": 120
-      }
-    },
-    {"name": "laptop", "ssh": "jirka@laptop.tailnet-name.ts.net"},
-    {"name": "grammetry", "ssh": "jirka@grammetry.tailnet-name.ts.net"}
+    {"name": "hub", "local": true}
   ]
 }

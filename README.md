@@ -38,75 +38,56 @@ host-sandbox --name hub serve --bind 0.0.0.0 --token 'a-long-random-secret'
 
 Do not expose an unauthenticated host-control MCP endpoint to the public Internet.
 
-or let the central router launch the stdio transport over SSH on demand. No extra daemon is required for that mode.
-
 ## Multi-computer setup
 
-The recommended topology is:
+The normal topology uses foreground outbound agents:
 
 ```text
-ChatGPT / MCP client
-        |
-        v
- central server
- host-sandbox router
-   |      |      |
-  SSH    SSH    SSH
-   |      |      |
-laptop grammetry server
+ChatGPT
+   |
+OpenAI Secure MCP Tunnel
+   |
+Orange Pi hub (always on)
+   |-- hub itself
+   |
+   +-- foreground client connections from other computers
 ```
 
-Connect the machines with Tailscale/WireGuard or another private network and configure key-based SSH from the central server.
+The Orange Pi keeps the ChatGPT-facing MCP endpoint on `127.0.0.1:8766`. A separate authenticated agent listener runs on port `8767` for computers you want to control.
 
-On the central server create `~/.config/host-sandbox/hosts.json` from `hosts.example.json`:
-
-```json
-{
-  "hosts": [
-    {"name": "hub", "local": true},
-    {"name": "laptop", "ssh": "jirka@laptop"},
-    {"name": "grammetry", "ssh": "jirka@grammetry"}
-  ]
-}
-```
-
-Start the router:
+On another computer, install `host-sandbox` and start:
 
 ```bash
-HOST_SANDBOX_ROUTER_TOKEN='use-a-long-random-token' \
-  host-sandbox router --bind 127.0.0.1 --port 8766
+host-sandbox connect
 ```
 
-For ChatGPT, use the single aggregate endpoint:
+By default this connects to `http://10.8.0.9:8767` and registers under that computer's hostname. While the command is running, the computer appears dynamically in `list_projects` and ChatGPT can use the same Sandbox-style file/command tools on it. Press `Ctrl-C` (or close the program) and the computer is immediately unregistered; after an unclean crash the hub expires it after a short heartbeat lease.
+
+Overrides are available when needed:
+
+```bash
+host-sandbox --name custom-name connect --hub http://other-hub:8767
+```
+
+The foreground client also starts a local activity dashboard at `http://127.0.0.1:8765/` unless `--no-dashboard` is supplied.
+
+The agent connection requires a shared token. The hub service installer generates it in `~/.config/host-sandbox/router.env`. Copy that value once to `~/.config/host-sandbox/client.env` on the client (mode `0600`):
+
+```text
+HOST_SANDBOX_AGENT_TOKEN=...
+```
+
+After that, `host-sandbox connect` needs no arguments. Do not paste this token into ChatGPT.
+
+Static SSH hosts remain supported as an optional fallback, but they are not required for the normal foreground-client workflow.
+
+For ChatGPT, the aggregate MCP endpoint remains:
 
 ```text
 http://127.0.0.1:8766/mcp
 ```
 
-The router exposes configured computers as projects/logical sessions, similar to Development Sandbox. `hub` with `local: true` runs directly on the Orange Pi; remote computers are reached through SSH. Per-host `/mcp/<host>` endpoints remain available for debugging.
-
-Create a **new** OpenAI tunnel and a **new** Host Sandbox plugin/app for this endpoint. The existing Development Sandbox tunnel stays independent and does not need to be modified.
-
-### Wake computers on demand
-
-A remote computer can stay powered off and be woken automatically on the first Host Sandbox tool call. Configure Wake-on-LAN on the hub:
-
-```json
-{
-  "name": "rtx3090",
-  "ssh": "jirka@192.168.50.123",
-  "wake_on_lan": {
-    "mac": "AA:BB:CC:DD:EE:FF",
-    "broadcast": "192.168.50.255",
-    "port": 9,
-    "timeout_seconds": 120
-  }
-}
-```
-
-The hub first probes SSH. If the host is offline, it sends the standard Wake-on-LAN magic packet and waits until SSH becomes reachable before starting the remote MCP stdio session. `wake_host(project=...)` is also available for an explicit wake. `list_projects`/`/health` report whether a host is wake-capable without waking it.
-
-Wake-on-LAN requires firmware/NIC support and generally works over the local Ethernet broadcast domain; do not use a Tailscale address as the broadcast target.
+Create a **new** OpenAI tunnel and a **new** Host Sandbox plugin/app for this endpoint. The existing Development Sandbox tunnel stays independent.
 
 ## Run as systemd user services
 
@@ -133,7 +114,7 @@ systemctl --user status host-sandbox-router host-sandbox-tunnel
 journalctl --user -u host-sandbox-router -u host-sandbox-tunnel -f
 ```
 
-The router service defaults to `127.0.0.1:8766`, which is sufficient for Secure MCP Tunnel. To intentionally expose it on the LAN/VPN, edit `~/.config/host-sandbox/router.env`, set `HOST_SANDBOX_ROUTER_BIND=0.0.0.0`, and restart the router. If exposing the MCP endpoint to other machines, protect it with a token/firewall/private network.
+The ChatGPT-facing router defaults to `127.0.0.1:8766`; the separate authenticated foreground-agent listener defaults to `0.0.0.0:8767`. The intended client address is `http://10.8.0.9:8767` over your private VPN.
 
 ## Local dashboard
 

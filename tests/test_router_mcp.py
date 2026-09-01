@@ -13,9 +13,10 @@ class FakeRouter:
         self.calls = []
     def list_hosts(self):
         return {"hosts": [{"name":"alpha","online":True},{"name":"beta","online":True}]}
-    def wake_host(self, host, wait_seconds=None):
-        self.calls.append((host,"wake_host",{"wait_seconds":wait_seconds}))
-        return {"host":host,"online":True,"woke":True}
+    def has_host(self, name):
+        return name in self.hosts
+    def project_entries(self):
+        return [{"id":name,"name":name,"description":"test host","transport":"mock"} for name in sorted(self.hosts)]
     def call_tool(self, host, name, arguments):
         self.calls.append((host,name,arguments))
         if name == "exec_command":
@@ -47,12 +48,6 @@ class RouterMCPTests(unittest.TestCase):
         self.assertIn("exec_command", names)
         self.assertIn("read_file", names)
         self.assertNotIn("host", listed["result"]["tools"][0]["inputSchema"].get("properties",{}))
-        self.assertIn("wake_host", names)
-        wake_tool=next(t for t in listed["result"]["tools"] if t["name"] == "wake_host")
-        self.assertIn("project", wake_tool["inputSchema"]["properties"])
-        self.assertFalse(wake_tool["annotations"]["readOnlyHint"])
-        result=m.call("wake_host", {"project":"beta","wait_seconds":30})
-        self.assertTrue(result["online"])
 
     def test_sdk_style_tool_metadata_and_modern_discover(self):
         mcp = RouterMCP(FakeRouter())

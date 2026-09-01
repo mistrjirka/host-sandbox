@@ -28,6 +28,14 @@ HOST_SANDBOX_AGENT_PORT=8767
 ENV
   chmod 600 "$CONFIG_DIR/router.env"
 fi
+for entry in \
+  'HOST_SANDBOX_AGENT_BIND=0.0.0.0' \
+  'HOST_SANDBOX_AGENT_PORT=8767'
+do
+  key="${entry%%=*}"
+  grep -q "^${key}=" "$CONFIG_DIR/router.env" || printf '%s\n' "$entry" >> "$CONFIG_DIR/router.env"
+done
+
 if ! grep -q '^HOST_SANDBOX_AGENT_TOKEN=' "$CONFIG_DIR/router.env"; then
   agent_token="$(python3 - <<'PYTOKEN'
 import secrets
@@ -64,8 +72,9 @@ sed \
   "$REPO_DIR/systemd/host-sandbox-tunnel.service" > "$USER_UNIT_DIR/host-sandbox-tunnel.service"
 
 systemctl --user daemon-reload
-systemctl --user enable --now host-sandbox-router.service
-systemctl --user enable --now host-sandbox-tunnel.service
+systemctl --user enable host-sandbox-router.service host-sandbox-tunnel.service
+systemctl --user restart host-sandbox-router.service
+systemctl --user restart host-sandbox-tunnel.service
 
 echo
 echo "Installed and started user services:"

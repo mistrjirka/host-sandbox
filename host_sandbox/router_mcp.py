@@ -24,6 +24,86 @@ def _session_schema(extra: dict[str, Any] | None = None, required: list[str] | N
     return _obj(props, ["session_id", *(required or [])])
 
 
+def _display_title(name: str) -> str:
+    return " ".join(part.capitalize() for part in name.split("_"))
+
+
+def _add_schema_titles(schema: dict[str, Any], *, root_title: str | None = None) -> dict[str, Any]:
+    """Make hand-written schemas resemble MCP SDK/Pydantic-generated schemas."""
+    if root_title and "title" not in schema:
+        schema["title"] = root_title
+    props = schema.get("properties")
+    if isinstance(props, dict):
+        for key, value in props.items():
+            if not isinstance(value, dict):
+                continue
+            value.setdefault("title", _display_title(key))
+            if value.get("type") == "object":
+                _add_schema_titles(value)
+            items = value.get("items")
+            if isinstance(items, dict):
+                _add_schema_titles(items)
+    items = schema.get("items")
+    if isinstance(items, dict):
+        _add_schema_titles(items)
+    return schema
+
+
+_TOOL_TITLES = {
+    "sandbox_health": "Sandbox health",
+    "list_projects": "List sandbox projects",
+    "list_sessions": "List development sessions",
+    "create_session": "Create development session",
+    "destroy_session": "Destroy development session",
+    "path_info": "Inspect path",
+    "list_repositories": "List repositories",
+    "exec_command": "Execute command",
+    "exec_commands": "Execute commands",
+    "list_jobs": "List command jobs",
+    "get_job": "Get command job",
+    "terminate_job": "Terminate command job",
+    "search_project": "Search repository files",
+    "read_file": "Read repository file",
+    "write_file": "Write repository file",
+    "replace_text": "Replace exact repository text",
+    "read_binary_file": "Read binary file",
+    "write_binary_file": "Write binary file",
+    "list_processes": "List host processes",
+    "signal_process": "Signal host process",
+}
+
+_READ_ONLY_TOOLS = {
+    "sandbox_health", "list_projects", "list_sessions", "path_info",
+    "list_repositories", "list_jobs", "get_job", "search_project",
+    "read_file", "read_binary_file", "list_processes",
+}
+_OPEN_WORLD_TOOLS = {"exec_command", "exec_commands"}
+_DESTRUCTIVE_TOOLS = {
+    "destroy_session", "exec_command", "exec_commands", "terminate_job",
+    "write_file", "replace_text", "write_binary_file", "signal_process",
+}
+
+
+def _decorate_router_tools(tools: list[dict[str, Any]]) -> None:
+    for tool in tools:
+        name = tool["name"]
+        tool["title"] = _TOOL_TITLES.get(name, _display_title(name))
+        _add_schema_titles(tool["inputSchema"], root_title=f"{name}Arguments")
+        tool["outputSchema"] = {
+            "additionalProperties": True,
+            "title": f"{name}DictOutput",
+            "type": "object",
+        }
+        read_only = name in _READ_ONLY_TOOLS
+        tool["annotations"] = {
+            "readOnlyHint": read_only,
+            "destructiveHint": name in _DESTRUCTIVE_TOOLS,
+            "idempotentHint": False,
+            "openWorldHint": name in _OPEN_WORLD_TOOLS,
+        }
+
+
+
 ROUTER_TOOLS: list[dict[str, Any]] = [
     {"name": "sandbox_health", "description": "Check that the Host Sandbox router and configured computers are reachable.", "inputSchema": _obj({})},
     {"name": "list_projects", "description": "List configured computers. Each computer is exposed as a Development-Sandbox-style project.", "inputSchema": _obj({})},
@@ -46,6 +126,8 @@ ROUTER_TOOLS: list[dict[str, Any]] = [
     {"name": "list_processes", "description": "List processes on the selected computer.", "inputSchema": _session_schema({"max_processes": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 500}})},
     {"name": "signal_process", "description": "Signal a process on the selected computer.", "inputSchema": _session_schema({"pid": {"type": "integer", "minimum": 2}, "signal": {"type": "string", "enum": ["TERM", "INT", "KILL", "HUP", "CONT", "STOP"], "default": "TERM"}}, ["pid"])},
 ]
+
+_decorate_router_tools(ROUTER_TOOLS)
 
 
 @dataclass
@@ -196,19 +278,54 @@ class RouterMCP:
             return self._remote(sid, "signal_process", {"pid": a["pid"], "sig": a.get("signal","TERM")})
         raise KeyError(f"unknown router tool: {name}")
 
+    @staticmethod
+    def _server_meta() -> dict[str, Any]:
+        return {"io.modelcontextprotocol/serverInfo": {"name": "host-sandbox-router", "version": "0.3.0"}}
+
+    @classmethod
+    def _modern_result(cls, payload: dict[str, Any], *, public: bool = False, ttl_ms: int = 0) -> dict[str, Any]:
+        return {
+            **payload,
+            "resultType": "complete",
+            "cacheScope": "public" if public else "private",
+            "ttlMs": ttl_ms,
+            "_meta": cls._server_meta(),
+        }
+
+    @staticmethod
+    def _is_modern(params: dict[str, Any]) -> bool:
+        meta = params.get("_meta") if isinstance(params, dict) else None
+        if not isinstance(meta, dict):
+            return False
+        version = meta.get("io.modelcontextprotocol/protocolVersion")
+        return version == "2026-07-28"
+
     def handle(self, req: dict[str, Any]) -> dict[str, Any] | None:
         rid = req.get("id"); method = req.get("method"); params = req.get("params") or {}
         if rid is None and str(method).startswith("notifications/"): return None
         try:
-            if method == "initialize":
-                result = {"protocolVersion": params.get("protocolVersion") or "2025-06-18", "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "host-sandbox-router", "version": "0.2.0"}, "instructions": "Multiple computers exposed through Development-Sandbox-style logical sessions. Tools execute directly on host OSes."}
-            elif method == "ping": result = {}
-            elif method == "tools/list": result = {"tools": ROUTER_TOOLS}
+            if method == "server/discover":
+                result = self._modern_result({
+                    "supportedVersions": ["2026-07-28"],
+                    "capabilities": {"tools": {"listChanged": False}},
+                    "instructions": "Multiple computers exposed through Development-Sandbox-style logical sessions. Tools execute directly on host OSes.",
+                }, public=True, ttl_ms=60_000)
+            elif method == "initialize":
+                requested = str(params.get("protocolVersion") or "2025-11-25")
+                negotiated = requested if requested in {"2025-06-18", "2025-11-25"} else "2025-11-25"
+                result = {"protocolVersion": negotiated, "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "host-sandbox-router", "version": "0.3.0"}, "instructions": "Multiple computers exposed through Development-Sandbox-style logical sessions. Tools execute directly on host OSes."}
+            elif method == "ping":
+                result = self._modern_result({}) if self._is_modern(params) else {}
+            elif method == "tools/list":
+                payload = {"tools": ROUTER_TOOLS}
+                result = self._modern_result(payload, public=True, ttl_ms=60_000) if self._is_modern(params) else payload
             elif method == "tools/call":
                 name = params.get("name"); arguments = dict(params.get("arguments") or {})
                 payload = self.call(str(name), arguments)
-                result = {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, default=str, indent=2)}], "structuredContent": payload, "isError": False}
-            else: raise KeyError(f"method not found: {method}")
+                body = {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, default=str, indent=2)}], "structuredContent": payload, "isError": False}
+                result = self._modern_result(body) if self._is_modern(params) else body
+            else:
+                return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"Method not found: {method}"}}
             return {"jsonrpc": "2.0", "id": rid, "result": result}
         except Exception as exc:
             return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": f"{type(exc).__name__}: {exc}"}}

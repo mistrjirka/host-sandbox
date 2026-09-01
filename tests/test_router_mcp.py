@@ -45,4 +45,19 @@ class RouterMCPTests(unittest.TestCase):
         self.assertIn("read_file", names)
         self.assertNotIn("host", listed["result"]["tools"][0]["inputSchema"].get("properties",{}))
 
+    def test_sdk_style_tool_metadata_and_modern_discover(self):
+        mcp = RouterMCP(FakeRouter())
+        tool = next(t for t in mcp.handle({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}})["result"]["tools"] if t["name"] == "list_jobs")
+        self.assertEqual(tool["title"], "List command jobs")
+        self.assertEqual(tool["inputSchema"]["title"], "list_jobsArguments")
+        self.assertEqual(tool["inputSchema"]["properties"]["session_id"]["title"], "Session Id")
+        self.assertEqual(tool["inputSchema"]["properties"]["limit"]["title"], "Limit")
+        self.assertEqual(tool["outputSchema"]["type"], "object")
+        self.assertTrue(tool["annotations"]["readOnlyHint"])
+        discover = mcp.handle({"jsonrpc":"2.0","id":2,"method":"server/discover","params":{}})["result"]
+        self.assertEqual(discover["supportedVersions"], ["2026-07-28"])
+        self.assertEqual(discover["resultType"], "complete")
+        self.assertEqual(discover["cacheScope"], "public")
+        self.assertIn("io.modelcontextprotocol/serverInfo", discover["_meta"])
+
 if __name__ == '__main__': unittest.main()

@@ -30,6 +30,14 @@ Then either run the local UI/MCP server:
 host-sandbox --name laptop serve --open
 ```
 
+`serve` deliberately binds to `127.0.0.1` by default. To expose a hub on your LAN or VPN, bind explicitly and use authentication:
+
+```bash
+host-sandbox --name hub serve --bind 0.0.0.0 --token 'a-long-random-secret'
+```
+
+Do not expose an unauthenticated host-control MCP endpoint to the public Internet.
+
 or let the central router launch the stdio transport over SSH on demand. No extra daemon is required for that mode.
 
 ## Multi-computer setup

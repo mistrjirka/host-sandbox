@@ -12,5 +12,17 @@ exec python3 -m host_sandbox.cli "\$@"
 EOF
 chmod +x "$PREFIX/bin/host-sandbox"
 printf 'Installed %s\n' "$PREFIX/bin/host-sandbox"
-case ":$PATH:" in *":$PREFIX/bin:"*) ;; *) printf 'Add %s/bin to PATH.\n' "$PREFIX";; esac
-printf 'Run: host-sandbox --name "My Laptop" serve --open\n'
+case ":$PATH:" in
+  *":$PREFIX/bin:"*) ;;
+  *)
+    printf 'For this shell, run: export PATH="%s/bin:$PATH"\n' "$PREFIX"
+    if [[ "$PREFIX" == "$HOME/.local" ]]; then
+      line='export PATH="$HOME/.local/bin:$PATH"'
+      touch "$HOME/.bashrc"
+      grep -Fqx "$line" "$HOME/.bashrc" || printf '\n%s\n' "$line" >> "$HOME/.bashrc"
+      printf 'Also added ~/.local/bin to ~/.bashrc for future Bash shells.\n'
+    fi
+    ;;
+esac
+printf 'Local-only: host-sandbox --name "My Laptop" serve --open\n'
+printf 'LAN/VPN:    host-sandbox --name "hub" serve --bind 0.0.0.0 --token <secret>\n'

@@ -1,5 +1,6 @@
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -49,6 +50,51 @@ class AgentTransportTests(unittest.TestCase):
                 self.assertNotIn("rtx3090", [p["id"] for p in aggregate.call("list_projects", {})["projects"]])
             finally:
                 stop.set(); thread.join(timeout=2); tools.close(); router.close()
+
+
+    def test_timed_out_call_is_removed_from_delivery_queue(self):
+        registry = AgentRegistry()
+        registration = registry.register("pc", "one")
+        agent_id = registration["agent_id"]
+        outcome = {}
+
+        def requester():
+            try:
+                registry.request("pc", "tools/call", {"name": "exec_command"}, timeout_seconds=1)
+            except Exception as exc:
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=requester)
+        thread.start()
+        time.sleep(0.05)
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertIsInstance(outcome.get("error"), TimeoutError)
+        self.assertIsNone(registry.poll(agent_id, 0))
+
+    def test_polled_call_carries_expiry_deadline(self):
+        registry = AgentRegistry()
+        registration = registry.register("pc", "one")
+        agent_id = registration["agent_id"]
+        outcome = {}
+
+        def requester():
+            outcome["result"] = registry.request("pc", "tools/list", {}, timeout_seconds=2)
+
+        thread = threading.Thread(target=requester)
+        thread.start()
+        deadline = time.time() + 1
+        call = None
+        while time.time() < deadline and call is None:
+            call = registry.poll(agent_id, 0)
+            if call is None:
+                time.sleep(0.01)
+        self.assertIsNotNone(call)
+        assert call is not None
+        self.assertGreater(call["expires_at"], time.time())
+        registry.submit_result(agent_id, call["call_id"], {"jsonrpc": "2.0", "id": call["call_id"], "result": {"ok": True}})
+        thread.join(timeout=2)
+        self.assertEqual(outcome.get("result"), {"ok": True})
 
     def test_duplicate_name_replaces_old_agent(self):
         registry = AgentRegistry()

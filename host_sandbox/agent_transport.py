@@ -15,6 +15,7 @@ class PendingCall:
     method: str
     params: dict[str, Any]
     created_at: float
+    expires_at: float
     event: threading.Event = field(default_factory=threading.Event, repr=False)
     response: dict[str, Any] | None = None
 
@@ -123,15 +124,27 @@ class AgentRegistry:
         deadline = time.monotonic() + max(0, min(int(wait_seconds), 25))
         with state.condition:
             state.last_seen = time.time()
-            while not state.queue:
+            while True:
+                now = time.time()
+                while state.queue:
+                    call = state.queue.popleft()
+                    # A requester may have timed out while this host was offline/busy.
+                    # Never deliver orphaned or expired calls to the computer later.
+                    if call.id not in state.pending or call.expires_at <= now:
+                        state.pending.pop(call.id, None)
+                        continue
+                    state.last_seen = now
+                    return {
+                        "call_id": call.id,
+                        "method": call.method,
+                        "params": call.params,
+                        "expires_at": call.expires_at,
+                    }
                 left = deadline - time.monotonic()
                 if left <= 0:
                     state.last_seen = time.time()
                     return None
                 state.condition.wait(timeout=left)
-            call = state.queue.popleft()
-            state.last_seen = time.time()
-            return {"call_id": call.id, "method": call.method, "params": call.params}
 
     def submit_result(self, agent_id: str, call_id: str, response: dict[str, Any]) -> None:
         state = self._state_by_id(agent_id)
@@ -149,13 +162,17 @@ class AgentRegistry:
             state = self._by_name.get(name)
         if state is None or not self._online(state):
             raise RuntimeError(f"host agent {name!r} is not connected; start host-sandbox connect on that computer")
-        call = PendingCall("c_" + uuid.uuid4().hex[:24], method, dict(params or {}), time.time())
+        timeout = max(1, int(timeout_seconds))
+        created_at = time.time()
+        call = PendingCall(
+            "c_" + uuid.uuid4().hex[:24], method, dict(params or {}), created_at, created_at + timeout
+        )
         with state.condition:
             state.pending[call.id] = call
             state.queue.append(call)
             state.condition.notify_all()
         try:
-            if not call.event.wait(timeout=max(1, int(timeout_seconds))):
+            if not call.event.wait(timeout=timeout):
                 raise TimeoutError(f"host agent {name!r} did not answer {method!r} within {timeout_seconds}s")
             response = call.response or {}
             if "error" in response:
@@ -164,6 +181,13 @@ class AgentRegistry:
         finally:
             with state.condition:
                 state.pending.pop(call.id, None)
+                # If the agent has not polled this call yet, remove it from the
+                # delivery queue as well. deque.remove is safe under condition.
+                try:
+                    state.queue.remove(call)
+                except ValueError:
+                    pass
+                state.condition.notify_all()
 
 
 class AgentMCPClient:

@@ -39,6 +39,13 @@ def _post_empty_ok(url: str, token: str, body: dict[str, Any], *, timeout: float
     _http_json(url, token, body, timeout=timeout)
 
 
+def _payload_expired(payload: dict[str, Any], *, now: float | None = None) -> bool:
+    expires_at = payload.get("expires_at")
+    if not isinstance(expires_at, (int, float)):
+        return False
+    return float(expires_at) <= (time.time() if now is None else now)
+
+
 def run_connected_agent(
     *,
     hub: str,
@@ -92,6 +99,9 @@ def run_connected_agent(
 
     def handle_call(payload: dict[str, Any], current_agent_id: str) -> None:
         call_id = str(payload["call_id"])
+        if _payload_expired(payload):
+            audit.add("connection", "Dropped expired tool call", status="error", call_id=call_id)
+            return
         request = {"jsonrpc": "2.0", "id": call_id, "method": payload["method"], "params": payload.get("params") or {}}
         response = mcp.handle(request)
         if response is None:
@@ -101,15 +111,33 @@ def run_connected_agent(
         except Exception as exc:
             audit.add("connection", "Failed to return tool result", status="error", call_id=call_id, error=str(exc))
 
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix="host-sandbox-call")
+    max_inflight_calls = 16
+    call_slots = threading.BoundedSemaphore(max_inflight_calls)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_inflight_calls, thread_name_prefix="host-sandbox-call")
+
+    def run_call(payload: dict[str, Any], current_agent_id: str) -> None:
+        try:
+            handle_call(payload, current_agent_id)
+        finally:
+            call_slots.release()
+
     try:
         while not stop.is_set():
+            if not call_slots.acquire(timeout=0.5):
+                continue
+            slot_owned = True
             try:
                 status, payload = _http_json(hub + "/agent/poll", token, {"agent_id": agent_id, "wait_seconds": 2}, timeout=6)
                 if status == 204 or not payload:
+                    call_slots.release()
+                    slot_owned = False
                     continue
-                pool.submit(handle_call, payload, agent_id)
+                pool.submit(run_call, payload, agent_id)
+                slot_owned = False
             except (OSError, RuntimeError, urllib.error.URLError) as exc:
+                if slot_owned:
+                    call_slots.release()
+                    slot_owned = False
                 if stop.is_set():
                     break
                 audit.add("connection", "Hub connection error", status="error", error=str(exc))

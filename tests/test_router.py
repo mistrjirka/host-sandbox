@@ -1,4 +1,4 @@
-import json, os, tempfile, unittest
+import json, os, tempfile, time, unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -23,6 +23,17 @@ class RouterTests(unittest.TestCase):
                     self.assertFalse(result['isError'])
                     self.assertIn('routed', result['structuredContent']['output_tail'])
                 finally:c.close()
+
+    def test_remote_mcp_timeout_resets_stuck_stdio_session(self):
+        client = RemoteMCP(HostConfig("stuck", local=True, command="python3 -c 'import time; time.sleep(60)'"))
+        started = time.monotonic()
+        try:
+            with self.assertRaises(TimeoutError):
+                client.request("tools/list", {}, timeout_seconds=1)
+            self.assertLess(time.monotonic() - started, 3)
+            self.assertIsNone(client._proc)
+        finally:
+            client.close()
 
     def test_config(self):
         with tempfile.TemporaryDirectory() as td:

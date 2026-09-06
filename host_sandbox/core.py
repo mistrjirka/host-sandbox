@@ -11,6 +11,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -34,6 +35,14 @@ def _decode_output(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+JOB_STATE_ENV = "HOST_SANDBOX_STATE_ID"
+JOB_ID_ENV = "HOST_SANDBOX_JOB_ID"
+RESERVED_JOB_ENV = frozenset({JOB_STATE_ENV, JOB_ID_ENV})
+TERMINAL_JOB_STATES = frozenset({"finished", "failed", "timed_out", "cancelled", "interrupted"})
+NONTERMINAL_JOB_STATES = frozenset({"queued", "waiting_for_lock", "running"})
+DEFAULT_RESOURCE_LOCK_WAIT_SECONDS = 30
+
+
 @dataclass
 class Job:
     id: str
@@ -41,21 +50,35 @@ class Job:
     cwd: str
     started_at: float
     timeout_seconds: int
-    process: subprocess.Popen[bytes]
+    process: subprocess.Popen[bytes] | None
     stdout_path: Path
     stderr_path: Path
-    stdout_file: Any = field(repr=False)
-    stderr_file: Any = field(repr=False)
-    timed_out: bool = False
-    timeout_timer: threading.Timer | None = field(default=None, repr=False)
+    state_path: Path
+    spec_path: Path
+    cancel_path: Path
+    resource_locks: list[str] = field(default_factory=list)
+    resource_lock_wait_seconds: int = DEFAULT_RESOURCE_LOCK_WAIT_SECONDS
+    stdout_file: Any | None = field(default=None, repr=False)
+    stderr_file: Any | None = field(default=None, repr=False)
+
+    def state(self) -> dict[str, Any]:
+        try:
+            value = json.loads(self.state_path.read_text())
+            return value if isinstance(value, dict) else {}
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return {}
 
     def status(self) -> str:
-        rc = self.process.poll()
-        if rc is None:
-            return "running"
-        if self.timed_out:
-            return "timed_out"
-        return "finished" if rc == 0 else "failed"
+        state = self.state()
+        status = str(state.get("status") or "")
+        if status:
+            return status
+        if self.process is not None:
+            rc = self.process.poll()
+            if rc is None:
+                return "queued"
+            return "finished" if rc == 0 else "failed"
+        return "interrupted"
 
 
 class HostTools(ParityHostToolsMixin):
@@ -66,9 +89,13 @@ class HostTools(ParityHostToolsMixin):
         self.state_dir = state_dir
         self.jobs_dir = state_dir / "jobs"
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        self.resource_locks_dir = state_dir / "resource-locks"
+        self.resource_locks_dir.mkdir(parents=True, exist_ok=True)
         self.cwd = str(Path(cwd or os.getcwd()).expanduser().resolve())
+        self._state_id = hashlib.sha256(str(state_dir.expanduser().resolve()).encode()).hexdigest()[:24]
         self._jobs: dict[str, Job] = {}
         self._jobs_lock = threading.RLock()
+        self._load_persisted_jobs()
 
     def _path(self, raw: str | None) -> Path:
         if raw is None or raw == "":
@@ -379,27 +406,103 @@ class HostTools(ParityHostToolsMixin):
                 continue
         return {"root": str(root), "query": query, "results": results, "truncated": False, "engine": "python"}
 
-    def _kill_job(self, job: Job, timed_out: bool = False) -> None:
-        if job.process.poll() is not None:
-            return
-        job.timed_out = timed_out
+    @staticmethod
+    def _write_json_private(path: Path, value: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp")
         try:
-            if os.name == "posix":
-                os.killpg(job.process.pid, signal.SIGTERM)
-            else:
-                job.process.terminate()
-        except ProcessLookupError:
-            return
-        try:
-            job.process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
+            tmp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+            os.chmod(tmp, 0o600)
+            tmp.replace(path)
+        finally:
             try:
-                if os.name == "posix":
-                    os.killpg(job.process.pid, signal.SIGKILL)
-                else:
-                    job.process.kill()
-            except ProcessLookupError:
+                tmp.unlink()
+            except FileNotFoundError:
                 pass
+
+    def _job_paths(self, job_id: str) -> tuple[Path, Path, Path, Path, Path]:
+        return (
+            self.jobs_dir / f"{job_id}.stdout",
+            self.jobs_dir / f"{job_id}.stderr",
+            self.jobs_dir / f"{job_id}.state.json",
+            self.jobs_dir / f"{job_id}.spec.json",
+            self.jobs_dir / f"{job_id}.cancel",
+        )
+
+    def _job_process_pids(self, job: Job) -> list[int]:
+        if os.name != "posix" or not Path("/proc").is_dir():
+            if job.process is not None and job.process.poll() is None:
+                return [job.process.pid]
+            return []
+        wanted = {
+            f"{JOB_STATE_ENV}={self._state_id}".encode(),
+            f"{JOB_ID_ENV}={job.id}".encode(),
+        }
+        uid = os.getuid()
+        found: list[int] = []
+        for proc in Path("/proc").iterdir():
+            if not proc.name.isdigit():
+                continue
+            try:
+                if proc.stat().st_uid != uid:
+                    continue
+                process_env = set((proc / "environ").read_bytes().split(b"\0"))
+            except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+                continue
+            if wanted.issubset(process_env):
+                found.append(int(proc.name))
+        return sorted(found)
+
+    def _signal_job_processes(self, job: Job, signum: int) -> list[int]:
+        signalled: list[int] = []
+        for pid in self._job_process_pids(job):
+            try:
+                os.kill(pid, signum)
+                signalled.append(pid)
+            except (ProcessLookupError, PermissionError):
+                continue
+        return signalled
+
+    def _update_job_state(self, job: Job, **updates: Any) -> dict[str, Any]:
+        state = job.state()
+        state.update(updates)
+        self._write_json_private(job.state_path, state)
+        return state
+
+    def _load_persisted_jobs(self) -> None:
+        for spec_path in sorted(self.jobs_dir.glob("j_*.spec.json")):
+            try:
+                spec = json.loads(spec_path.read_text())
+                job_id = str(spec["id"])
+                stdout_path, stderr_path, state_path, _, cancel_path = self._job_paths(job_id)
+                job = Job(
+                    id=job_id,
+                    command=str(spec.get("command") or ""),
+                    cwd=str(spec.get("cwd") or self.cwd),
+                    started_at=float(spec.get("created_at") or time.time()),
+                    timeout_seconds=int(spec.get("timeout_seconds") or 3600),
+                    process=None,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    state_path=state_path,
+                    spec_path=spec_path,
+                    cancel_path=cancel_path,
+                    resource_locks=list(spec.get("resource_locks") or []),
+                    resource_lock_wait_seconds=int(
+                        spec.get("resource_lock_wait_seconds", DEFAULT_RESOURCE_LOCK_WAIT_SECONDS)
+                    ),
+                )
+                if job.status() in NONTERMINAL_JOB_STATES and not self._job_process_pids(job):
+                    self._update_job_state(
+                        job,
+                        status="interrupted",
+                        exit_code=125,
+                        finished_at=time.time(),
+                        interrupted_reason="controller_recovered_without_runner",
+                    )
+                self._jobs[job_id] = job
+            except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+                continue
 
     @staticmethod
     def _read_stream(path: Path, offset: int, limit: int) -> tuple[str, int, int, bool]:
@@ -416,7 +519,16 @@ class HostTools(ParityHostToolsMixin):
 
     @staticmethod
     def _close_job_streams(job: Job) -> None:
+        if job.process is not None:
+            job.process.poll()
+            if job.process.returncode is None and job.status() in TERMINAL_JOB_STATES:
+                try:
+                    job.process.wait(timeout=0.25)
+                except subprocess.TimeoutExpired:
+                    pass
         for stream in (job.stdout_file, job.stderr_file):
+            if stream is None:
+                continue
             try:
                 stream.flush()
             except (OSError, ValueError):
@@ -425,29 +537,54 @@ class HostTools(ParityHostToolsMixin):
                 stream.close()
             except (OSError, ValueError):
                 pass
+        job.stdout_file = None
+        job.stderr_file = None
 
     def _job_dict(self, job: Job, output_bytes: int = 65536) -> dict[str, Any]:
-        rc = job.process.poll()
-        if rc is not None:
+        state = job.state()
+        status = str(state.get("status") or job.status())
+        if status in NONTERMINAL_JOB_STATES and job.process is not None:
+            runner_rc = job.process.poll()
+            if runner_rc is not None and not self._job_process_pids(job):
+                state = self._update_job_state(
+                    job,
+                    status="failed",
+                    exit_code=int(runner_rc),
+                    finished_at=time.time(),
+                    interrupted_reason="runner_exited_without_terminal_state",
+                )
+                status = "failed"
+        if status in TERMINAL_JOB_STATES:
             self._close_job_streams(job)
+        exit_code = state.get("exit_code")
+        if exit_code is None and job.process is not None and job.process.poll() is not None and status not in NONTERMINAL_JOB_STATES:
+            exit_code = job.process.returncode
         budget = max(0, int(output_bytes))
         stdout, stdout_next, stdout_size, stdout_more = self._read_stream(job.stdout_path, 0, budget)
         used = len(stdout.encode("utf-8", errors="replace"))
         stderr_budget = max(0, budget - used)
         stderr, stderr_next, stderr_size, stderr_more = self._read_stream(job.stderr_path, 0, stderr_budget)
         returned = len(stdout.encode("utf-8", errors="replace")) + len(stderr.encode("utf-8", errors="replace"))
-        duration = max(0.0, time.time() - job.started_at)
+        finished_at = state.get("finished_at")
+        duration = max(0.0, float(finished_at or time.time()) - job.started_at)
         return {
             "id": job.id,
             "command": job.command,
             "cwd": job.cwd,
-            "pid": job.process.pid,
-            "status": job.status(),
-            "exit_code": rc,
-            "started_at": job.started_at,
+            "pid": state.get("child_pid") or state.get("runner_pid") or (job.process.pid if job.process else None),
+            "runner_pid": state.get("runner_pid"),
+            "status": status,
+            "exit_code": exit_code,
+            "started_at": state.get("started_at") or job.started_at,
+            "running_at": state.get("running_at"),
+            "finished_at": finished_at,
             "duration_seconds": duration,
             "duration_ms": round(duration * 1000, 3),
             "timeout_seconds": job.timeout_seconds,
+            "timeout_stage": state.get("timeout_stage"),
+            "interrupted_reason": state.get("interrupted_reason"),
+            "resource_locks": list(job.resource_locks),
+            "resource_lock_wait_seconds": job.resource_lock_wait_seconds,
             "stdout": stdout,
             "stderr": stderr,
             "stdout_offset": 0,
@@ -460,10 +597,19 @@ class HostTools(ParityHostToolsMixin):
             "stderr_size": stderr_size,
             "max_output_bytes_total": budget,
             "returned_output_bytes": returned,
-            # Temporary backwards compatibility for pre-0.5 router/client code.
             "output_tail": stdout + stderr,
             "output_size": stdout_size + stderr_size,
         }
+
+    @staticmethod
+    def _normalize_resource_locks(names: list[str] | None) -> list[str]:
+        normalized = sorted({str(name) for name in (names or []) if str(name)})
+        if len(normalized) > 16:
+            raise ValueError("at most 16 resource locks are allowed")
+        for name in normalized:
+            if len(name) > 100 or any(not (ch.isalnum() or ch in "_.:-") for ch in name):
+                raise ValueError(f"invalid resource lock name: {name!r}")
+        return normalized
 
     def exec_command(
         self,
@@ -473,43 +619,111 @@ class HostTools(ParityHostToolsMixin):
         wait_seconds: int = 8,
         max_output_bytes: int = 131072,
         env: dict[str, str] | None = None,
+        resource_locks: list[str] | None = None,
+        resource_lock_wait_seconds: int | None = None,
     ) -> dict[str, Any]:
         run_cwd = str(self._path(cwd or self.cwd))
         timeout_seconds = _clamp(timeout_seconds, 1, 604800)
         wait_seconds = _clamp(wait_seconds, 0, 20)
         max_output_bytes = _clamp(max_output_bytes, 1000, 2_097_152)
+        lock_wait = DEFAULT_RESOURCE_LOCK_WAIT_SECONDS if resource_lock_wait_seconds is None else _clamp(resource_lock_wait_seconds, 0, 604800)
+        locks = self._normalize_resource_locks(resource_locks)
         job_id = "j_" + uuid.uuid4().hex[:16]
-        stdout_path = self.jobs_dir / f"{job_id}.stdout"
-        stderr_path = self.jobs_dir / f"{job_id}.stderr"
-        stdout_file = stdout_path.open("wb")
-        stderr_file = stderr_path.open("wb")
+        stdout_path, stderr_path, state_path, spec_path, cancel_path = self._job_paths(job_id)
         child_env = os.environ.copy()
         if env:
-            child_env.update({str(k): str(v) for k, v in env.items()})
+            for key, value in env.items():
+                key = str(key)
+                if key in RESERVED_JOB_ENV:
+                    raise ValueError(f"reserved environment variable: {key}")
+                child_env[key] = str(value)
+        child_env[JOB_STATE_ENV] = self._state_id
+        child_env[JOB_ID_ENV] = job_id
         if os.name == "posix":
             shell_path = child_env.get("SHELL") or "/bin/bash"
             if not (os.path.isabs(shell_path) and os.access(shell_path, os.X_OK)):
                 shell_path = "/bin/bash"
-            argv: Any = [shell_path, "-c", command]
         else:
-            argv = command
-        proc = subprocess.Popen(
-            argv, cwd=run_cwd, env=child_env, stdin=subprocess.DEVNULL,
-            stdout=stdout_file, stderr=stderr_file, start_new_session=(os.name == "posix"),
-            shell=(os.name != "posix"),
+            shell_path = child_env.get("COMSPEC") or "cmd.exe"
+        created_at = time.time()
+        spec = {
+            "id": job_id,
+            "state_id": self._state_id,
+            "command": command,
+            "cwd": run_cwd,
+            "shell": shell_path,
+            "created_at": created_at,
+            "timeout_seconds": timeout_seconds,
+            "resource_locks": locks,
+            "resource_lock_wait_seconds": lock_wait,
+            "state_path": str(state_path),
+            "cancel_path": str(cancel_path),
+            "lock_dir": str(self.resource_locks_dir),
+        }
+        self._write_json_private(spec_path, spec)
+        self._write_json_private(
+            state_path,
+            {
+                "id": job_id,
+                "status": "queued",
+                "started_at": created_at,
+                "exit_code": None,
+                "timeout_stage": None,
+                "interrupted_reason": None,
+            },
         )
-        job = Job(job_id, command, run_cwd, time.time(), timeout_seconds, proc, stdout_path, stderr_path, stdout_file, stderr_file)
+        try:
+            cancel_path.unlink()
+        except FileNotFoundError:
+            pass
+        stdout_file = stdout_path.open("wb")
+        stderr_file = stderr_path.open("wb")
+        runner_path = Path(__file__).with_name("job_runner.py")
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, str(runner_path), str(spec_path)],
+                cwd=run_cwd,
+                env=child_env,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                start_new_session=(os.name == "posix"),
+            )
+        except Exception:
+            stdout_file.close()
+            stderr_file.close()
+            for partial in (stdout_path, stderr_path, state_path, spec_path, cancel_path):
+                try:
+                    partial.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
+        job = Job(
+            job_id,
+            command,
+            run_cwd,
+            created_at,
+            timeout_seconds,
+            proc,
+            stdout_path,
+            stderr_path,
+            state_path,
+            spec_path,
+            cancel_path,
+            locks,
+            lock_wait,
+            stdout_file,
+            stderr_file,
+        )
         with self._jobs_lock:
             self._jobs[job_id] = job
-        timer = threading.Timer(timeout_seconds, self._kill_job, args=(job, True))
-        timer.daemon = True; job.timeout_timer = timer; timer.start()
         if wait_seconds > 0:
             try:
                 proc.wait(timeout=wait_seconds)
             except subprocess.TimeoutExpired:
                 pass
         if proc.poll() is not None:
-            timer.cancel(); self._close_job_streams(job)
+            self._close_job_streams(job)
         return self._job_dict(job, max_output_bytes)
 
     def exec_commands(self, commands: list[dict[str, Any]], concurrency: int = 8) -> dict[str, Any]:
@@ -535,8 +749,11 @@ class HostTools(ParityHostToolsMixin):
         if not job:
             raise KeyError(f"unknown job: {job_id}")
         for stream in (job.stdout_file, job.stderr_file):
-            try: stream.flush()
-            except (OSError, ValueError): pass
+            if stream is not None:
+                try:
+                    stream.flush()
+                except (OSError, ValueError):
+                    pass
         budget = _clamp(max_bytes, 1000, 2_097_152)
         stdout, stdout_next, stdout_size, stdout_more = self._read_stream(job.stdout_path, stdout_offset, budget)
         used = len(stdout.encode("utf-8", errors="replace"))
@@ -557,16 +774,16 @@ class HostTools(ParityHostToolsMixin):
             job = self._jobs.get(job_id)
             if not job:
                 raise KeyError(f"unknown job: {job_id}")
-            if job.process.poll() is None:
+            if job.status() not in TERMINAL_JOB_STATES:
                 raise RuntimeError("cannot delete a running job")
             self._jobs.pop(job_id, None)
-        if job.timeout_timer:
-            job.timeout_timer.cancel()
         self._close_job_streams(job)
         deleted = []
-        for path in (job.stdout_path, job.stderr_path):
-            try: path.unlink(); deleted.append(str(path))
-            except FileNotFoundError: pass
+        for path in (job.stdout_path, job.stderr_path, job.state_path, job.spec_path, job.cancel_path):
+            try:
+                path.unlink(); deleted.append(str(path))
+            except FileNotFoundError:
+                pass
         return {"job_id": job_id, "deleted": True, "files": deleted}
 
     def cleanup_jobs(
@@ -577,7 +794,7 @@ class HostTools(ParityHostToolsMixin):
         cap = _clamp(max_delete, 1, 100000)
         now = time.time()
         with self._jobs_lock:
-            finished = [j for j in self._jobs.values() if j.process.poll() is not None]
+            finished = [j for j in self._jobs.values() if j.status() in TERMINAL_JOB_STATES]
             finished.sort(key=lambda j: j.started_at, reverse=True)
             protected = {j.id for j in finished[:keep]}
             candidates = [j for j in finished if j.id not in protected and now-j.started_at >= age][:cap]
@@ -592,22 +809,41 @@ class HostTools(ParityHostToolsMixin):
             job = self._jobs.get(job_id)
         if not job:
             raise KeyError(f"unknown job: {job_id}")
-        if job.process.poll() is not None:
+        if job.status() in TERMINAL_JOB_STATES:
             return self._job_dict(job)
         signum = getattr(signal, f"SIG{sig.upper()}", None)
         if signum is None:
             raise ValueError("unsupported signal")
-        if os.name == "posix": os.killpg(job.process.pid, signum)
-        else: job.process.send_signal(signum)
+        cancelling = sig.upper() not in {"CONT", "STOP"}
+        if cancelling:
+            job.cancel_path.write_text(sig.upper() + "\n")
+            os.chmod(job.cancel_path, 0o600)
+        signalled = self._signal_job_processes(job, int(signum))
+        if not signalled and job.process is not None and job.process.poll() is None:
+            try:
+                if os.name == "posix":
+                    os.killpg(job.process.pid, int(signum))
+                else:
+                    job.process.send_signal(int(signum))
+                signalled.append(job.process.pid)
+            except ProcessLookupError:
+                pass
         force = _clamp(force_after_seconds, 0, 60)
-        if force and sig.upper() != "KILL":
-            try: job.process.wait(timeout=force)
-            except subprocess.TimeoutExpired:
-                try:
-                    if os.name == "posix": os.killpg(job.process.pid, signal.SIGKILL)
-                    else: job.process.kill()
-                except ProcessLookupError: pass
-        return self._job_dict(job)
+        if cancelling and force and sig.upper() != "KILL":
+            deadline = time.monotonic() + force
+            while time.monotonic() < deadline:
+                if not self._job_process_pids(job) or job.status() in TERMINAL_JOB_STATES:
+                    break
+                time.sleep(0.05)
+            if self._job_process_pids(job):
+                self._signal_job_processes(job, int(signal.SIGKILL))
+        if cancelling:
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline and self._job_process_pids(job):
+                time.sleep(0.025)
+            if not self._job_process_pids(job) and job.status() not in TERMINAL_JOB_STATES:
+                self._update_job_state(job, status="cancelled", exit_code=137 if sig.upper() == "KILL" else 143, finished_at=time.time())
+        return {**self._job_dict(job), "signal_sent": bool(signalled), "pids_signalled": signalled}
 
     def list_processes(self, max_processes: int = 500) -> dict[str, Any]:
         limit = _clamp(max_processes, 1, 10000)
@@ -636,13 +872,32 @@ class HostTools(ParityHostToolsMixin):
         signum = getattr(signal, f"SIG{sig.upper()}", None)
         if signum is None:
             raise ValueError("unsupported signal")
-        os.kill(int(pid), signum)
-        return {"pid": int(pid), "signal": sig.upper(), "sent": True}
+        target = int(pid)
+        with self._jobs_lock:
+            jobs = list(self._jobs.values())
+        for job in jobs:
+            state = job.state()
+            main_pids = {state.get("runner_pid"), state.get("child_pid")}
+            if job.process is not None:
+                main_pids.add(job.process.pid)
+            if target in main_pids and job.status() not in TERMINAL_JOB_STATES:
+                result = self.signal_job(job.id, sig, 0)
+                return {
+                    "pid": target,
+                    "signal": sig.upper(),
+                    "sent": bool(result.get("signal_sent", True)),
+                    "associated_job_id": job.id,
+                }
+        os.kill(target, signum)
+        return {"pid": target, "signal": sig.upper(), "sent": True, "associated_job_id": None}
 
     def close(self) -> None:
         with self._jobs_lock:
             jobs = list(self._jobs.values())
         for job in jobs:
-            if job.process.poll() is None:
-                self._kill_job(job)
+            if job.status() not in TERMINAL_JOB_STATES:
+                try:
+                    self.signal_job(job.id, "TERM", 2)
+                except (OSError, RuntimeError):
+                    self._signal_job_processes(job, int(signal.SIGKILL))
             self._close_job_streams(job)

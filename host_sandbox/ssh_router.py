@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import selectors
 import socket
 import subprocess
 import threading
@@ -109,41 +110,77 @@ class RemoteMCP:
         )
         return self._proc
 
-    def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
+    def request(
+        self, method: str, params: dict[str, Any] | None = None, timeout_seconds: int = 180
+    ) -> Any:
+        timeout = max(1, int(timeout_seconds))
         with self._lock:
             p = self._start()
             assert p.stdin is not None and p.stdout is not None
             rid = self._next_id
             self._next_id += 1
-            p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params or {}}) + "\n")
-            p.stdin.flush()
-            line = p.stdout.readline()
-            if not line:
-                err = p.stderr.read() if p.stderr else ""
-                raise RuntimeError(f"SSH MCP session to {self.host.name} closed: {err.strip()}")
-            msg = json.loads(line)
-            if msg.get("id") != rid:
-                raise RuntimeError(f"unexpected MCP response id from {self.host.name}")
-            if "error" in msg:
-                raise RuntimeError(str(msg["error"]))
-            return msg.get("result")
+            try:
+                p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params or {}}) + "\n")
+                p.stdin.flush()
+                selector = selectors.DefaultSelector()
+                try:
+                    selector.register(p.stdout, selectors.EVENT_READ)
+                    ready = selector.select(timeout)
+                finally:
+                    selector.close()
+                if not ready:
+                    self._close_unlocked()
+                    raise TimeoutError(
+                        f"SSH MCP request to {self.host.name!r} timed out after {timeout}s"
+                    )
+                line = p.stdout.readline()
+                if not line:
+                    err = ""
+                    if p.stderr is not None and p.poll() is not None:
+                        try:
+                            err = p.stderr.read(4000)
+                        except OSError:
+                            pass
+                    self._close_unlocked()
+                    raise RuntimeError(f"SSH MCP session to {self.host.name} closed: {err.strip()}")
+                msg = json.loads(line)
+                if msg.get("id") != rid:
+                    self._close_unlocked()
+                    raise RuntimeError(f"unexpected MCP response id from {self.host.name}")
+                if "error" in msg:
+                    raise RuntimeError(str(msg["error"]))
+                return msg.get("result")
+            except (BrokenPipeError, OSError):
+                self._close_unlocked()
+                raise
 
-    def close(self) -> None:
-        with self._lock:
-            p = self._proc
-            if p is None:
-                return
-            if p.poll() is None:
-                p.terminate()
+
+    def _close_unlocked(self) -> None:
+        p = self._proc
+        if p is None:
+            return
+        if p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                p.kill()
                 try:
                     p.wait(timeout=2)
                 except subprocess.TimeoutExpired:
-                    p.kill(); p.wait(timeout=2)
-            for stream in (p.stdin, p.stdout, p.stderr):
-                if stream is not None:
-                    try: stream.close()
-                    except OSError: pass
-            self._proc = None
+                    pass
+        for stream in (p.stdin, p.stdout, p.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        self._proc = None
+
+    def close(self) -> None:
+        with self._lock:
+            self._close_unlocked()
+
 
 
 class SSHRouter:

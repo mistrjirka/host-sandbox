@@ -158,8 +158,8 @@ ROUTER_TOOLS: list[dict[str, Any]] = [
     {"name": "destroy_session", "description": "Remove a logical host session. Files and processes on the computer are not deleted.", "inputSchema": _obj({"session_id": {"type": "string"}}, ["session_id"])},
     {"name": "path_info", "description": "Inspect a file or directory on the selected computer.", "inputSchema": _session_schema({"repo": {"type": "string", "default": "."}, "path": {"type": "string", "default": "."}, "include_hidden": {"type": "boolean", "default": True}, "max_entries": {"type": "integer", "minimum": 1, "maximum": 20000, "default": 2000}})},
     {"name": "list_repositories", "description": "Discover Git repositories below the selected computer's workspace root.", "inputSchema": _session_schema({"max_depth": {"type": "integer", "minimum": 1, "maximum": 8, "default": 3}, "limit": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 1000}})},
-    {"name": "exec_command", "description": "Run an unrestricted command directly on the selected computer.", "inputSchema": _session_schema({"command": {"type": "string", "maxLength": 1000000}, "cwd": {"type": "string", "default": "."}, "env": {"type": ["object", "null"], "additionalProperties": {"type": "string"}}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 604800, "default": 3600}, "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 20, "default": 8}, "max_output_bytes": {"type": "integer", "minimum": 1000, "maximum": 2097152, "default": 131072}, "resource_locks": {"type": "array", "items": {"type": "string"}, "maxItems": 16, "default": []}}, ["command"])},
-    {"name": "exec_commands", "description": "Run independent commands on one or more selected computers concurrently.", "inputSchema": _obj({"commands": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "properties": {"session_id": {"type": "string"}, "command": {"type": "string"}, "cwd": {"type": "string", "default": "."}, "env": {"type": ["object", "null"], "additionalProperties": {"type": "string"}}, "timeout_seconds": {"type": "integer", "default": 3600}, "wait_seconds": {"type": "integer", "default": 8}, "max_output_bytes": {"type": "integer", "default": 131072}, "resource_locks": {"type": "array", "items": {"type": "string"}, "maxItems": 16}}, "required": ["session_id", "command"]}}, "concurrency": {"type": "integer", "minimum": 1, "maximum": 32, "default": 16}}, ["commands"])},
+    {"name": "exec_command", "description": "Run an unrestricted command directly on the selected computer.", "inputSchema": _session_schema({"command": {"type": "string", "maxLength": 1000000}, "cwd": {"type": "string", "default": "."}, "env": {"type": ["object", "null"], "additionalProperties": {"type": "string"}}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 604800, "default": 3600}, "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 20, "default": 8}, "max_output_bytes": {"type": "integer", "minimum": 1000, "maximum": 2097152, "default": 131072}, "resource_lock_wait_seconds": {"type": ["integer", "null"], "minimum": 0, "maximum": 604800, "default": None}, "resource_locks": {"type": "array", "items": {"type": "string"}, "maxItems": 16, "default": []}}, ["command"])},
+    {"name": "exec_commands", "description": "Run independent commands on one or more selected computers concurrently.", "inputSchema": _obj({"commands": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "properties": {"session_id": {"type": "string"}, "command": {"type": "string"}, "cwd": {"type": "string", "default": "."}, "env": {"type": ["object", "null"], "additionalProperties": {"type": "string"}}, "timeout_seconds": {"type": "integer", "default": 3600}, "wait_seconds": {"type": "integer", "default": 8}, "max_output_bytes": {"type": "integer", "default": 131072}, "resource_lock_wait_seconds": {"type": ["integer", "null"], "minimum": 0, "maximum": 604800}, "resource_locks": {"type": "array", "items": {"type": "string"}, "maxItems": 16}}, "required": ["session_id", "command"]}}, "concurrency": {"type": "integer", "minimum": 1, "maximum": 32, "default": 16}}, ["commands"])},
     {"name": "list_jobs", "description": "List recent command jobs for a host session.", "inputSchema": _session_schema({"limit": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 50}})},
     {"name": "get_job", "description": "Read a host command job and its paginated output.", "inputSchema": _session_schema({"job_id": {"type": "string"}, "stdout_offset": {"type": "integer", "minimum": 0, "default": 0}, "stderr_offset": {"type": "integer", "minimum": 0, "default": 0}, "max_bytes": {"type": "integer", "minimum": 1000, "maximum": 2097152, "default": 131072}}, ["job_id"])},
     {"name": "delete_job", "description": "Delete durable stdout/stderr/state for a finished job.", "inputSchema": _session_schema({"job_id": {"type": "string", "pattern": "^j_[a-f0-9]{16}$"}}, ["job_id"])},
@@ -202,8 +202,6 @@ class RouterMCP:
         self.router = router
         self._lock = threading.RLock()
         self._sessions: dict[str, LogicalSession] = {}
-        self._resource_locks_guard = threading.RLock()
-        self._resource_locks: dict[tuple[str, str], threading.Lock] = {}
         self.state_path = Path(state_path).expanduser() if state_path else None
         self._load()
 
@@ -245,26 +243,9 @@ class RouterMCP:
             return result["structuredContent"]
         return result
 
-    def _resource_lock_objects(self, sid: str, names: list[str] | None) -> list[threading.Lock]:
+    def _remote(self, sid: str, tool: str, args: dict[str, Any]) -> Any:
         s = self._session(sid)
-        normalized = sorted({str(name) for name in (names or []) if str(name)})
-        if len(normalized) > 16:
-            raise ValueError("at most 16 resource locks are allowed")
-        with self._resource_locks_guard:
-            return [self._resource_locks.setdefault((s.project, name), threading.Lock()) for name in normalized]
-
-    def _remote(self, sid: str, tool: str, args: dict[str, Any], resource_locks: list[str] | None = None) -> Any:
-        locks = self._resource_lock_objects(sid, resource_locks)
-        acquired: list[threading.Lock] = []
-        try:
-            for lock in locks:
-                lock.acquire()
-                acquired.append(lock)
-            s = self._session(sid)
-            return self._payload(self.router.call_tool(s.project, tool, args))
-        finally:
-            for lock in reversed(acquired):
-                lock.release()
+        return self._payload(self.router.call_tool(s.project, tool, args))
 
     @staticmethod
     def _join(repo: str = ".", path: str = ".") -> str:
@@ -373,9 +354,8 @@ class RouterMCP:
             def run_batch_item(raw: dict[str, Any]) -> Any:
                 item = dict(raw)
                 sid = str(item.pop("session_id"))
-                locks = list(item.pop("resource_locks", []) or [])
-                args = {k: item[k] for k in ("command", "cwd", "env", "timeout_seconds", "wait_seconds", "max_output_bytes") if k in item}
-                return self._remote(sid, "exec_command", args, locks)
+                args = {k: item[k] for k in ("command", "cwd", "env", "timeout_seconds", "wait_seconds", "max_output_bytes", "resource_lock_wait_seconds", "resource_locks") if k in item}
+                return self._remote(sid, "exec_command", args)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
                 futures = [pool.submit(run_batch_item, item) for item in commands]
@@ -383,9 +363,8 @@ class RouterMCP:
 
         sid = str(a.pop("session_id"))
         if name == "exec_command":
-            locks = list(a.pop("resource_locks", []) or [])
-            args = {k: a[k] for k in ("command","cwd","env","timeout_seconds","wait_seconds","max_output_bytes") if k in a}
-            return self._remote(sid, "exec_command", args, locks)
+            args = {k: a[k] for k in ("command","cwd","env","timeout_seconds","wait_seconds","max_output_bytes","resource_lock_wait_seconds","resource_locks") if k in a}
+            return self._remote(sid, "exec_command", args)
         if name == "list_jobs":
             return self._remote(sid, "list_jobs", {"limit": a.get("limit", 50)})
         if name == "get_job":

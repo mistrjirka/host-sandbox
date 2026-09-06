@@ -5,18 +5,24 @@ Host-native MCP tool bridge inspired by the Development Sandbox. It runs tools d
 ## What it can do
 
 - unrestricted command execution as the launching user
-- separate paginated stdout/stderr durable jobs, termination, deletion and cleanup
+- separate paginated stdout/stderr durable jobs, persistent recovery, termination, deletion and cleanup
 - text reads/writes plus native MCP binary resources and native image content (up to 16 MiB)
 - batched `read_files`, `search_many`, and concurrent `exec_commands`
 - Git patch validation/application and bounded status/diff inspection
 - persistent interactive tmux terminal reads, text input and control/navigation keys
-- host-scoped resource locks such as `gpu:all`
+- host-scoped durable resource locks such as `gpu:all`, with an independent bounded lock-wait timeout
 - process listing/signalling and repository/path discovery
 - foreground outbound clients that appear only while `host-sandbox connect` is running
 - local activity dashboard plus an always-on Orange Pi router/OpenAI tunnel
 - optional static SSH hosts as a fallback transport
 
 This deliberately has **no container boundary**. Anything the launching user can modify can also be modified through the tool bridge.
+
+### Durable job lifecycle
+
+`exec_command` and `exec_commands` keep long work in durable host-side runners. `timeout_seconds` limits execution **after** resource locks are acquired; `resource_lock_wait_seconds` independently limits how long a job may wait for locks such as `gpu:all` (30 seconds by default). Locks remain held for the complete job lifetime, not merely until the initial MCP response returns.
+
+Job metadata and output live under the configured state directory, so a restarted `host-sandbox` controller can recover and terminate jobs that are still running. When a job finishes, times out, or is cancelled, descendants that detached into a new process group are also cleaned up.
 
 ## Install on each computer
 
@@ -124,7 +130,7 @@ The ChatGPT-facing router defaults to `127.0.0.1:8766`; the separate authenticat
 
 ## Current parity status
 
-Version 0.5 exposes the same 30 public tool names as the current Development Sandbox, including `search_many`, `read_files`, native `read_binary_file` / `view_image`, Git helpers, separate stdout/stderr job pagination, job cleanup, resource locks, and tmux terminal controls. Binary and image payloads are returned as native MCP `EmbeddedResource` / `ImageContent` rather than duplicated inside structured JSON.
+Version 0.5.1 exposes the same 30 public tool names as the current Development Sandbox, including `search_many`, `read_files`, native `read_binary_file` / `view_image`, Git helpers, separate stdout/stderr job pagination, job cleanup, resource locks, and tmux terminal controls. Binary and image payloads are returned as native MCP `EmbeddedResource` / `ImageContent` rather than duplicated inside structured JSON.
 
 The intentional architectural difference is session lifecycle: Development Sandbox sessions are isolated containers attached to persistent `/workspace`; Host Sandbox sessions are lightweight logical handles selecting a real computer and execute with the permissions of the user who started `host-sandbox connect`. Stopping that foreground client removes the computer from the hub. Static SSH transport remains optional for machines where that behavior is desired.
 

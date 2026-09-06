@@ -58,42 +58,21 @@ class RouterMCPTests(unittest.TestCase):
             exec_hosts=[host for host,name,_ in router.calls if name == "exec_command"]
             self.assertEqual(set(exec_hosts), {"alpha", "beta"})
 
-    def test_resource_locks_serialize_same_host_but_not_other_hosts(self):
-        class SlowRouter(FakeRouter):
-            def __init__(self):
-                super().__init__(); self.timeline=[]; self.guard=threading.Lock()
-            def call_tool(self, host, name, arguments):
-                if name == "exec_command":
-                    with self.guard: self.timeline.append((host, "start", time.monotonic()))
-                    time.sleep(0.18)
-                    with self.guard: self.timeline.append((host, "end", time.monotonic()))
-                    return {"structuredContent": {"exit_code":0,"output_tail":host}}
-                return super().call_tool(host,name,arguments)
-
+    def test_resource_lock_settings_are_forwarded_to_controlled_host(self):
         with tempfile.TemporaryDirectory() as td:
-            router=SlowRouter(); m=RouterMCP(router, Path(td)/"sessions.json")
-            alpha1=m.call("create_session", {"project":"alpha"})["id"]
-            alpha2=m.call("create_session", {"project":"alpha"})["id"]
-            beta=m.call("create_session", {"project":"beta"})["id"]
-            started=time.monotonic()
-            result=m.call("exec_commands", {
-                "commands":[
-                    {"session_id":alpha1,"command":"a1","resource_locks":["gpu:all"]},
-                    {"session_id":alpha2,"command":"a2","resource_locks":["gpu:all"]},
-                    {"session_id":beta,"command":"b","resource_locks":["gpu:all"]},
-                ],
-                "concurrency":3,
+            router = FakeRouter(); m = RouterMCP(router, Path(td) / "sessions.json")
+            sid = m.call("create_session", {"project": "alpha"})["id"]
+            result = m.call("exec_command", {
+                "session_id": sid,
+                "command": "printf alpha",
+                "resource_locks": ["gpu:all"],
+                "resource_lock_wait_seconds": 123,
             })
-            elapsed=time.monotonic()-started
-            self.assertEqual(len(result["results"]),3)
-            # Two alpha calls sharing gpu:all must serialize (~0.36s total), while beta may overlap.
-            self.assertGreater(elapsed,0.33)
-            self.assertLess(elapsed,0.52)
-            alpha_starts=[t for h,e,t in router.timeline if h=="alpha" and e=="start"]
-            alpha_ends=[t for h,e,t in router.timeline if h=="alpha" and e=="end"]
-            self.assertGreaterEqual(max(alpha_starts), min(alpha_ends)-0.02)
-            beta_start=next(t for h,e,t in router.timeline if h=="beta" and e=="start")
-            self.assertLess(beta_start, min(alpha_ends))
+            self.assertEqual(result["exit_code"], 0)
+            _, tool, arguments = router.calls[-1]
+            self.assertEqual(tool, "exec_command")
+            self.assertEqual(arguments["resource_locks"], ["gpu:all"])
+            self.assertEqual(arguments["resource_lock_wait_seconds"], 123)
 
     def test_resource_lock_schema_matches_development_sandbox(self):
         m=RouterMCP(FakeRouter())
@@ -102,9 +81,13 @@ class RouterMCPTests(unittest.TestCase):
         locks=exec_tool["inputSchema"]["properties"]["resource_locks"]
         self.assertEqual(locks["type"],"array")
         self.assertEqual(locks["maxItems"],16)
+        lock_wait=exec_tool["inputSchema"]["properties"]["resource_lock_wait_seconds"]
+        self.assertEqual(lock_wait["maximum"],604800)
         batch=next(t for t in listed["result"]["tools"] if t["name"]=="exec_commands")
-        item_locks=batch["inputSchema"]["properties"]["commands"]["items"]["properties"]["resource_locks"]
+        item_props=batch["inputSchema"]["properties"]["commands"]["items"]["properties"]
+        item_locks=item_props["resource_locks"]
         self.assertEqual(item_locks["maxItems"],16)
+        self.assertEqual(item_props["resource_lock_wait_seconds"]["maximum"],604800)
 
     def test_mcp_single_endpoint_surface(self):
         m=RouterMCP(FakeRouter())

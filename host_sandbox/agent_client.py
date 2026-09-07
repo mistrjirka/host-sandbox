@@ -19,6 +19,26 @@ from .http_server import HostHTTPServer, run_http
 from .mcp import MCPServer
 
 
+class HubHTTPError(RuntimeError):
+    def __init__(self, status_code: int, detail: str):
+        self.status_code = int(status_code)
+        self.detail = detail
+        super().__init__(f"hub returned HTTP {self.status_code}: {detail}")
+
+
+def poll_error_requires_reregistration(exc: BaseException) -> bool:
+    return isinstance(exc, HubHTTPError) and exc.status_code == 404
+
+
+def poll_retry_delay(exc: BaseException) -> float:
+    current: BaseException | object = exc
+    if isinstance(current, urllib.error.URLError):
+        current = current.reason
+    if isinstance(current, TimeoutError) or "timed out" in str(current).lower():
+        return 0.25
+    return 1.0
+
+
 def _http_json(url: str, token: str, body: dict[str, Any], *, timeout: float = 30) -> tuple[int, dict[str, Any] | None]:
     data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
     req = urllib.request.Request(url, data=data, method="POST", headers={
@@ -32,7 +52,7 @@ def _http_json(url: str, token: str, body: dict[str, Any], *, timeout: float = 3
     except urllib.error.HTTPError as exc:
         raw = exc.read()
         detail = raw.decode("utf-8", errors="replace")[:4000]
-        raise RuntimeError(f"hub returned HTTP {exc.code}: {detail}") from exc
+        raise HubHTTPError(exc.code, detail) from exc
 
 
 def _post_empty_ok(url: str, token: str, body: dict[str, Any], *, timeout: float = 10) -> None:
@@ -141,14 +161,25 @@ def run_connected_agent(
                 if stop.is_set():
                     break
                 audit.add("connection", "Hub connection error", status="error", error=str(exc))
-                time.sleep(2)
-                # Re-register after a hub restart or expired agent id.
-                try:
-                    _, registration = _http_json(hub + "/agent/register", token, {"name": name, "instance_id": instance_id, "system_info": system_info()}, timeout=10)
-                    if registration:
-                        agent_id = str(registration["agent_id"])
-                except Exception:
-                    pass
+                # Socket/poll timeouts do not invalidate the registration. A
+                # re-register on every transient timeout used to create needless
+                # churn and could make the router flap the host offline. Only a
+                # definite unknown-agent response (HTTP 404) requires a new ID.
+                if poll_error_requires_reregistration(exc):
+                    try:
+                        _, registration = _http_json(
+                            hub + "/agent/register", token,
+                            {"name": name, "instance_id": instance_id, "system_info": system_info()},
+                            timeout=10,
+                        )
+                        if registration:
+                            agent_id = str(registration["agent_id"])
+                    except Exception as register_exc:
+                        audit.add(
+                            "connection", "Hub re-registration failed",
+                            status="error", error=str(register_exc),
+                        )
+                time.sleep(poll_retry_delay(exc))
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
         try:

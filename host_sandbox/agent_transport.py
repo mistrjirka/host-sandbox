@@ -33,11 +33,22 @@ class AgentState:
     condition: threading.Condition = field(default_factory=threading.Condition, repr=False)
 
 
+DEFAULT_AGENT_LEASE_SECONDS = 60
+DEFAULT_REPLACEMENT_GRACE_SECONDS = 15
+DEFAULT_AGENT_CALL_TIMEOUT_SECONDS = 24
+
+
 class AgentRegistry:
     """In-memory registry for foreground host agents using outbound long polling."""
 
-    def __init__(self, *, lease_seconds: int = 15) -> None:
+    def __init__(
+        self,
+        *,
+        lease_seconds: int = DEFAULT_AGENT_LEASE_SECONDS,
+        replacement_grace_seconds: int = DEFAULT_REPLACEMENT_GRACE_SECONDS,
+    ) -> None:
         self.lease_seconds = max(10, int(lease_seconds))
+        self.replacement_grace_seconds = max(1, min(self.lease_seconds, int(replacement_grace_seconds)))
         self._lock = threading.RLock()
         self._by_name: dict[str, AgentState] = {}
         self._by_id: dict[str, AgentState] = {}
@@ -64,14 +75,16 @@ class AgentRegistry:
                         "name": old.name,
                         "lease_seconds": self.lease_seconds,
                     }
-                if self._online(old, now):
+                if (now - old.last_seen) <= self.replacement_grace_seconds:
                     # Never let a second physical client with the same host name
-                    # evict a healthy connection. Logical ChatGPT sessions all
-                    # share the host agent and must not compete for ownership.
+                    # evict a recently polling connection. Keep this guard shorter
+                    # than the availability lease: logical sessions tolerate a
+                    # transient network gap for longer, while a genuinely crashed
+                    # connector can still be replaced promptly.
                     raise RuntimeError(
                         f"agent name {name!r} is already connected by another live instance"
                     )
-                self._drop_locked(old, reason="stale client lease replaced by a new connection")
+                self._drop_locked(old, reason="stale client replaced by a new connection")
 
             state = AgentState(
                 name=name,
@@ -179,7 +192,13 @@ class AgentRegistry:
             call.event.set()
             state.condition.notify_all()
 
-    def request(self, name: str, method: str, params: dict[str, Any] | None = None, timeout_seconds: int = 180) -> Any:
+    def request(
+        self,
+        name: str,
+        method: str,
+        params: dict[str, Any] | None = None,
+        timeout_seconds: int = DEFAULT_AGENT_CALL_TIMEOUT_SECONDS,
+    ) -> Any:
         with self._lock:
             state = self._by_name.get(name)
         if state is None or not self._online(state):
@@ -212,13 +231,47 @@ class AgentRegistry:
                 state.condition.notify_all()
 
 
+def agent_request_timeout(method: str, params: dict[str, Any] | None = None) -> int:
+    """Keep the router response comfortably inside the tunnel response deadline.
+
+    Structured exec calls intentionally return a durable job after wait_seconds;
+    there is no reason for the hub to hold its HTTP/MCP request for minutes when
+    an outbound agent stops polling.
+    """
+    if method != "tools/call":
+        return 12
+    payload = params or {}
+    name = str(payload.get("name") or "")
+    arguments = payload.get("arguments") or {}
+    if name == "exec_command" and isinstance(arguments, dict):
+        try:
+            wait = max(0, min(20, int(arguments.get("wait_seconds", 8))))
+        except (TypeError, ValueError):
+            wait = 8
+        return min(DEFAULT_AGENT_CALL_TIMEOUT_SECONDS, max(10, wait + 5))
+    if name == "exec_commands" and isinstance(arguments, dict):
+        waits = []
+        for item in arguments.get("commands") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                waits.append(max(0, min(20, int(item.get("wait_seconds", 8)))))
+            except (TypeError, ValueError):
+                waits.append(8)
+        wait = max(waits, default=8)
+        return min(DEFAULT_AGENT_CALL_TIMEOUT_SECONDS, max(10, wait + 5))
+    return DEFAULT_AGENT_CALL_TIMEOUT_SECONDS
+
+
 class AgentMCPClient:
     def __init__(self, registry: AgentRegistry, name: str) -> None:
         self.registry = registry
         self.name = name
 
     def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
-        return self.registry.request(self.name, method, params)
+        return self.registry.request(
+            self.name, method, params, timeout_seconds=agent_request_timeout(method, params)
+        )
 
     def close(self) -> None:
         pass

@@ -3,8 +3,14 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from host_sandbox.ssh_router import HostConfig, RemoteMCP, SSHRouter, _mac_bytes, _send_magic_packet, wake_host
+from host_sandbox.router_server import RouterHTTPServer
+from host_sandbox.agent_server import AgentHTTPServer
 
 class RouterTests(unittest.TestCase):
+    def test_http_listener_backlogs_handle_concurrent_tunnel_and_agent_bursts(self):
+        self.assertGreaterEqual(RouterHTTPServer.request_queue_size, 64)
+        self.assertGreaterEqual(AgentHTTPServer.request_queue_size, 64)
+
     def test_remote_mcp_over_fake_ssh(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); bindir=root/'bin'; bindir.mkdir()

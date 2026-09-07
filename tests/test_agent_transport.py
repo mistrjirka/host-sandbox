@@ -4,7 +4,7 @@ import time
 import unittest
 from pathlib import Path
 
-from host_sandbox.agent_transport import AgentRegistry
+from host_sandbox.agent_transport import AgentMCPClient, AgentRegistry, agent_request_timeout
 from host_sandbox.audit import AuditLog
 from host_sandbox.core import HostTools
 from host_sandbox.mcp import MCPServer
@@ -139,6 +139,33 @@ class AgentTransportTests(unittest.TestCase):
             registry.register("pc", "two")
         self.assertTrue(registry.is_online("pc"))
         self.assertIsNone(registry.poll(first["agent_id"], 0))
+
+
+    def test_default_lease_tolerates_short_poll_outage(self):
+        registry = AgentRegistry()
+        registry.register("pc", "one")
+        with registry._lock:
+            state = registry._by_name["pc"]
+            state.last_seen = time.time() - 30
+        self.assertTrue(registry.is_online("pc"))
+        with registry._lock:
+            registry._by_name["pc"].last_seen = time.time() - 61
+        self.assertFalse(registry.is_online("pc"))
+
+    def test_replacement_guard_is_shorter_than_availability_lease(self):
+        registry = AgentRegistry()
+        first = registry.register("pc", "one")
+        with registry._lock:
+            registry._by_name["pc"].last_seen = time.time() - 16
+        self.assertTrue(registry.is_online("pc"))
+        second = registry.register("pc", "two")
+        self.assertNotEqual(first["agent_id"], second["agent_id"])
+
+    def test_agent_request_timeout_stays_below_tunnel_window(self):
+        self.assertEqual(agent_request_timeout("tools/list", {}), 12)
+        self.assertEqual(agent_request_timeout("tools/call", {"name": "exec_command", "arguments": {"wait_seconds": 0}}), 10)
+        self.assertEqual(agent_request_timeout("tools/call", {"name": "exec_command", "arguments": {"wait_seconds": 20}}), 24)
+        self.assertEqual(agent_request_timeout("tools/call", {"name": "read_file", "arguments": {}}), 24)
 
     def test_different_instance_can_replace_expired_lease(self):
         registry = AgentRegistry(lease_seconds=10)

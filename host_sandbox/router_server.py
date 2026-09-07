@@ -13,6 +13,7 @@ from .router_mcp import RouterMCP
 class RouterHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 64
 
     def __init__(self, addr: tuple[str, int], router: SSHRouter, token: str | None, state_path: str | None = None):
         super().__init__(addr, RouterHandler)
@@ -38,12 +39,18 @@ class RouterHandler(BaseHTTPRequestHandler):
 
     def _json(self, obj: Any, status: int = 200) -> None:
         data = json.dumps(obj, ensure_ascii=False, default=str, separators=(",", ":")).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # The tunnel may cancel its local HTTP request when the upstream
+            # response deadline expires. Do not turn that expected disconnect
+            # into a second write attempt and traceback storm.
+            self.close_connection = True
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path

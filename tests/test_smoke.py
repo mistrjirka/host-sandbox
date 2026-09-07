@@ -106,6 +106,17 @@ class Smoke(unittest.TestCase):
         self.assertEqual(self.tools.read_job(first["id"], max_bytes=1000)["status"], "finished")
         self.assertEqual(self.tools.read_job(second["id"], max_bytes=1000)["status"], "finished")
 
+    def test_closing_peer_tools_does_not_cancel_durable_job(self):
+        root = Path(self.tmp.name)
+        result = self.tools.exec_command("sleep 5", wait_seconds=0, timeout_seconds=20)
+        time.sleep(0.15)
+        peer = HostTools(AuditLog(root / "state"), root / "state", str(root))
+        peer.close()
+        state = self.tools.read_job(result["id"], max_bytes=1000)
+        self.assertIn(state["status"], {"running", "waiting_for_lock"})
+        stopped = self.tools.signal_job(result["id"], "TERM", 1)
+        self.assertEqual(stopped["status"], "cancelled")
+
     def test_persisted_running_job_can_be_recovered_and_cancelled(self):
         root = Path(self.tmp.name)
         recovered_tools = None

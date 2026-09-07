@@ -12,6 +12,7 @@ from .agent_transport import AgentRegistry
 class AgentHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 64
 
     def __init__(self, addr: tuple[str, int], registry: AgentRegistry, token: str):
         super().__init__(addr, AgentHandler)
@@ -33,13 +34,16 @@ class AgentHandler(BaseHTTPRequestHandler):
 
     def _json(self, value: Any, status: int = 200) -> None:
         data = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":")).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        if data:
-            self.wfile.write(data)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if data:
+                self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            self.close_connection = True
 
     def _body(self) -> dict[str, Any]:
         n = int(self.headers.get("Content-Length", "0"))

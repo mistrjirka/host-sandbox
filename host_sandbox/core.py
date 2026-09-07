@@ -892,12 +892,14 @@ class HostTools(ParityHostToolsMixin):
         return {"pid": target, "signal": sig.upper(), "sent": True, "associated_job_id": None}
 
     def close(self) -> None:
+        # Durable jobs are intentionally process-independent and recoverable by a
+        # later HostTools instance. Closing an MCP/HTTP/stdio server must therefore
+        # not terminate nonterminal jobs found in the shared state directory. That
+        # was especially dangerous for nested host-sandbox instances: a nested
+        # server could load the outer Connect-to-Computers job and kill its parent
+        # while shutting down. Explicit signal_job/signal_process remains the
+        # cancellation mechanism.
         with self._jobs_lock:
             jobs = list(self._jobs.values())
         for job in jobs:
-            if job.status() not in TERMINAL_JOB_STATES:
-                try:
-                    self.signal_job(job.id, "TERM", 2)
-                except (OSError, RuntimeError):
-                    self._signal_job_processes(job, int(signal.SIGKILL))
             self._close_job_streams(job)

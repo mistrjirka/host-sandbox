@@ -74,20 +74,18 @@ class RouterMCPTests(unittest.TestCase):
             self.assertEqual(arguments["resource_locks"], ["gpu:all"])
             self.assertEqual(arguments["resource_lock_wait_seconds"], 123)
 
-    def test_resource_lock_schema_matches_development_sandbox(self):
+    def test_resource_lock_schema_keeps_legacy_exec_resource_stable(self):
         m=RouterMCP(FakeRouter())
         listed=m.handle({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}})
         exec_tool=next(t for t in listed["result"]["tools"] if t["name"]=="exec_command")
-        locks=exec_tool["inputSchema"]["properties"]["resource_locks"]
-        self.assertEqual(locks["type"],"array")
-        self.assertEqual(locks["maxItems"],16)
-        lock_wait=exec_tool["inputSchema"]["properties"]["resource_lock_wait_seconds"]
-        self.assertEqual(lock_wait["maximum"],604800)
+        props=exec_tool["inputSchema"]["properties"]
+        self.assertEqual(props["resource_locks"]["type"],"array")
+        self.assertEqual(props["resource_locks"]["maxItems"],16)
+        self.assertNotIn("resource_lock_wait_seconds", props)
         batch=next(t for t in listed["result"]["tools"] if t["name"]=="exec_commands")
         item_props=batch["inputSchema"]["properties"]["commands"]["items"]["properties"]
-        item_locks=item_props["resource_locks"]
-        self.assertEqual(item_locks["maxItems"],16)
-        self.assertEqual(item_props["resource_lock_wait_seconds"]["maximum"],604800)
+        self.assertEqual(item_props["resource_locks"]["maxItems"],16)
+        self.assertNotIn("resource_lock_wait_seconds", item_props)
 
     def test_mcp_single_endpoint_surface(self):
         m=RouterMCP(FakeRouter())

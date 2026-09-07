@@ -96,9 +96,55 @@ class AgentTransportTests(unittest.TestCase):
         thread.join(timeout=2)
         self.assertEqual(outcome.get("result"), {"ok": True})
 
-    def test_duplicate_name_replaces_old_agent(self):
+    def test_same_instance_reregistration_resumes_without_dropping_pending_call(self):
+        registry = AgentRegistry()
+        first = registry.register("pc", "one", {"generation": 1})
+        outcome = {}
+
+        def requester():
+            try:
+                outcome["result"] = registry.request("pc", "tools/list", {}, timeout_seconds=2)
+            except Exception as exc:
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=requester)
+        thread.start()
+        deadline = time.time() + 1
+        while time.time() < deadline:
+            with registry._lock:
+                state = registry._by_name["pc"]
+                if state.pending:
+                    break
+            time.sleep(0.01)
+
+        resumed = registry.register("pc", "one", {"generation": 2})
+        self.assertEqual(first["agent_id"], resumed["agent_id"])
+        call = registry.poll(resumed["agent_id"], 0)
+        self.assertIsNotNone(call)
+        assert call is not None
+        registry.submit_result(
+            resumed["agent_id"], call["call_id"],
+            {"jsonrpc": "2.0", "id": call["call_id"], "result": {"ok": True}},
+        )
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn("error", outcome)
+        self.assertEqual(outcome.get("result"), {"ok": True})
+        self.assertEqual(registry.list_agents()[0]["system_info"], {"generation": 2})
+
+    def test_different_live_instance_cannot_replace_existing_agent(self):
         registry = AgentRegistry()
         first = registry.register("pc", "one")
+        with self.assertRaisesRegex(RuntimeError, "already connected by another live instance"):
+            registry.register("pc", "two")
+        self.assertTrue(registry.is_online("pc"))
+        self.assertIsNone(registry.poll(first["agent_id"], 0))
+
+    def test_different_instance_can_replace_expired_lease(self):
+        registry = AgentRegistry(lease_seconds=10)
+        first = registry.register("pc", "one")
+        with registry._lock:
+            registry._by_name["pc"].last_seen = time.time() - 11
         second = registry.register("pc", "two")
         self.assertNotEqual(first["agent_id"], second["agent_id"])
         self.assertTrue(registry.is_online("pc"))

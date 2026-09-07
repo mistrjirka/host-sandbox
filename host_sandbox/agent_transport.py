@@ -46,19 +46,41 @@ class AgentRegistry:
         name = name.strip()
         if not name or len(name) > 100:
             raise ValueError("agent name must contain 1-100 characters")
+        instance_id = instance_id or uuid.uuid4().hex
         now = time.time()
-        state = AgentState(
-            name=name,
-            agent_id="a_" + uuid.uuid4().hex[:24],
-            instance_id=instance_id or uuid.uuid4().hex,
-            registered_at=now,
-            last_seen=now,
-            system_info=dict(system_info or {}),
-        )
         with self._lock:
             old = self._by_name.get(name)
             if old is not None:
-                self._drop_locked(old, reason="replaced by a new client connection")
+                if old.instance_id == instance_id:
+                    # A foreground agent deliberately keeps instance_id stable
+                    # while re-registering after transient poll/HTTP failures.
+                    # Resume the existing state so queued and in-flight calls are
+                    # not failed merely because the same physical client retried.
+                    old.last_seen = now
+                    if system_info is not None:
+                        old.system_info = dict(system_info)
+                    return {
+                        "agent_id": old.agent_id,
+                        "name": old.name,
+                        "lease_seconds": self.lease_seconds,
+                    }
+                if self._online(old, now):
+                    # Never let a second physical client with the same host name
+                    # evict a healthy connection. Logical ChatGPT sessions all
+                    # share the host agent and must not compete for ownership.
+                    raise RuntimeError(
+                        f"agent name {name!r} is already connected by another live instance"
+                    )
+                self._drop_locked(old, reason="stale client lease replaced by a new connection")
+
+            state = AgentState(
+                name=name,
+                agent_id="a_" + uuid.uuid4().hex[:24],
+                instance_id=instance_id,
+                registered_at=now,
+                last_seen=now,
+                system_info=dict(system_info or {}),
+            )
             self._by_name[name] = state
             self._by_id[state.agent_id] = state
         return {"agent_id": state.agent_id, "name": state.name, "lease_seconds": self.lease_seconds}

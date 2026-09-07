@@ -12,6 +12,10 @@ StandardOutput=append:%h/.local/state/host-sandbox/tunnel-service.log
 StandardError=append:%h/.local/state/host-sandbox/tunnel-service.log
 Type=simple
 EnvironmentFile=%h/.config/host-sandbox/tunnel.env
+# Type=simple marks the router started before its Python listener has necessarily
+# bound port 8766. Wait for the local MCP socket so the tunnel does not begin
+# with a transient connection-refused / missing-resource window.
+ExecStartPre=/bin/bash -c 'for i in {1..100}; do (echo > /dev/tcp/127.0.0.1/8766) >/dev/null 2>&1 && exit 0; sleep 0.1; done; exit 1'
 ExecStart=%h/programy/tunnel-client/tunnel-client run --profile host-sandbox
 Restart=on-failure
 RestartSec=3

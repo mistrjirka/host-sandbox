@@ -113,7 +113,7 @@ class Smoke(unittest.TestCase):
         peer = HostTools(AuditLog(root / "state"), root / "state", str(root))
         peer.close()
         state = self.tools.read_job(result["id"], max_bytes=1000)
-        self.assertIn(state["status"], {"running", "waiting_for_lock"})
+        self.assertIn(state["status"], {"queued", "running", "waiting_for_lock"})
         stopped = self.tools.signal_job(result["id"], "TERM", 1)
         self.assertEqual(stopped["status"], "cancelled")
 

@@ -44,7 +44,7 @@ host-sandbox --name laptop serve --open
 host-sandbox --name hub serve --bind 0.0.0.0 --token 'a-long-random-secret'
 ```
 
-Do not expose an unauthenticated host-control MCP endpoint to the public Internet.
+A network bind without a token now fails at startup. Loopback MCP clients can still call every tool without a token. Browser requests from other origins, DNS-rebinding Host headers, and non-JSON MCP requests are rejected. If a trusted tunnel preserves its public Host header, set `HOST_SANDBOX_ALLOWED_HOSTS=your-tunnel-hostname` on the router (use an exact host you control).
 
 ## Multi-computer setup
 
@@ -77,7 +77,7 @@ Overrides are available when needed:
 host-sandbox --name custom-name connect --hub http://other-hub:8767
 ```
 
-The foreground client also starts a local activity dashboard at `http://127.0.0.1:8765/` unless `--no-dashboard` is supplied. Interactive terminal tools require `tmux` on that controlled computer; all other tools remain usable without tmux.
+The foreground client also starts a local, read-only activity dashboard at `http://127.0.0.1:8765/` unless `--no-dashboard` is supplied. This dashboard deliberately has **no `/mcp` command endpoint**. The hub still has unrestricted host tools for the connected client. The dashboard only binds to loopback. Interactive terminal tools require `tmux` on that controlled computer; all other tools remain usable without tmux.
 
 The agent connection requires a shared token. The hub service installer generates it in `~/.config/host-sandbox/router.env`. Copy that value once to `~/.config/host-sandbox/client.env` on the client (mode `0600`):
 
@@ -126,7 +126,7 @@ The ChatGPT-facing router defaults to `127.0.0.1:8766`; the separate authenticat
 
 ## Local dashboard
 
-`host-sandbox serve --open` opens the activity screen. It shows observable tool activity such as commands, file operations, jobs, exit states and output. It does not expose hidden model chain-of-thought.
+`host-sandbox serve --open` opens the activity screen. It shows observable tool activity such as commands, file operations, jobs, exit states and output. It does not expose hidden model chain-of-thought. If you start `serve` with `--token`, the activity API also requires that token. Enter it into the dashboard's **Access token** field. The token stays in the current page's memory and is not embedded in the URL or HTML.
 
 ## Current parity status
 

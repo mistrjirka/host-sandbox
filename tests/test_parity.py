@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from host_sandbox.audit import AuditLog
-from host_sandbox.core import HostTools
+from host_sandbox.core import HostTools, TERMINAL_JOB_STATES
 from host_sandbox.mcp import MCPServer
 from host_sandbox.router_mcp import ROUTER_TOOLS, RouterMCP
 from host_sandbox.ssh_router import HostConfig
@@ -51,6 +51,13 @@ class ParityTests(unittest.TestCase):
         self.sid = self.aggregate.call("create_session", {"project": "pc"})["id"]
 
     def tearDown(self):
+        # The controller deliberately does not stop durable jobs on close.
+        # The test fixture must wait for its own runners before deleting state.
+        for job in list(self.tools._jobs.values()):
+            if job.status() not in TERMINAL_JOB_STATES:
+                self.tools.signal_job(job.id, "KILL", 1)
+            if job.process is not None:
+                job.process.wait(timeout=3)
         self.tools.close()
         self.tmp.cleanup()
 
@@ -71,6 +78,10 @@ class ParityTests(unittest.TestCase):
             "command": "printf stdout-abc; printf stderr-xyz >&2",
             "wait_seconds": 2,
         })
+        deadline = time.monotonic() + 8
+        while result["status"] not in TERMINAL_JOB_STATES and time.monotonic() < deadline:
+            time.sleep(0.05)
+            result = self.aggregate.call("get_job", {"session_id": self.sid, "job_id": result["id"]})
         self.assertEqual(result["exit_code"], 0)
         self.assertEqual(result["stdout"], "stdout-abc")
         self.assertEqual(result["stderr"], "stderr-xyz")

@@ -15,6 +15,7 @@ from typing import Any
 
 from .audit import AuditLog
 from .core import HostTools
+from .http_security import is_loopback_bind
 from .http_server import HostHTTPServer, run_http
 from .mcp import MCPServer
 
@@ -79,6 +80,8 @@ def run_connected_agent(
 ) -> int:
     if not token:
         raise ValueError("agent token is required")
+    if dashboard and not is_loopback_bind(dashboard_bind):
+        raise ValueError("the connected agent dashboard must bind to loopback")
     hub = hub.rstrip("/")
     audit = AuditLog(state_dir)
     tools = HostTools(audit, state_dir, cwd)
@@ -102,7 +105,7 @@ def run_connected_agent(
     dashboard_thread: threading.Thread | None = None
 
     if dashboard:
-        dashboard_server = HostHTTPServer((dashboard_bind, dashboard_port), mcp, tools, audit, name, None)
+        dashboard_server = HostHTTPServer((dashboard_bind, dashboard_port), mcp, tools, audit, name, None, mcp_enabled=False)
         dashboard_thread = threading.Thread(target=run_http, args=(dashboard_server,), name="host-sandbox-dashboard", daemon=True)
         dashboard_thread.start()
 

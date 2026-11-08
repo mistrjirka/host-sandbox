@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .agent_transport import AgentRegistry
+from .http_security import HTTPRequestError, read_json_body, request_origin_allowed
 
 
 class AgentHTTPServer(ThreadingHTTPServer):
@@ -15,6 +16,8 @@ class AgentHTTPServer(ThreadingHTTPServer):
     request_queue_size = 64
 
     def __init__(self, addr: tuple[str, int], registry: AgentRegistry, token: str):
+        if not token:
+            raise ValueError("agent listener requires an authentication token")
         super().__init__(addr, AgentHandler)
         self.registry = registry
         self.agent_token = token
@@ -30,7 +33,7 @@ class AgentHandler(BaseHTTPRequestHandler):
     def _authorized(self) -> bool:
         auth = self.headers.get("Authorization", "")
         supplied = auth[7:] if auth.lower().startswith("bearer ") else ""
-        return bool(self.server.agent_token) and secrets.compare_digest(supplied, self.server.agent_token)
+        return secrets.compare_digest(supplied, self.server.agent_token)
 
     def _json(self, value: Any, status: int = 200) -> None:
         data = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":")).encode()
@@ -45,31 +48,45 @@ class AgentHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             self.close_connection = True
 
-    def _body(self) -> dict[str, Any]:
-        n = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(n)
-        value = json.loads(raw or b"{}")
-        if not isinstance(value, dict):
-            raise ValueError("request body must be an object")
-        return value
+    def _guard(self) -> bool:
+        if request_origin_allowed(self.headers, self.server.server_address[0]):
+            return True
+        self.close_connection = True
+        self._json({"error": "untrusted Host or Origin"}, 403)
+        return False
 
     def do_GET(self) -> None:
+        if not self._guard():
+            return
         if urlparse(self.path).path == "/health":
+            if not self._authorized():
+                return self._json({"ok": True})
             return self._json({"ok": True, "agents": self.server.registry.list_agents()})
         return self._json({"error": "not found"}, 404)
 
     def do_POST(self) -> None:
+        if not self._guard():
+            return
         if not self._authorized():
+            self.close_connection = True
             return self._json({"error": "unauthorized"}, 401)
         path = urlparse(self.path).path
+        if path not in {"/agent/register", "/agent/poll", "/agent/result", "/agent/disconnect"}:
+            self.close_connection = True
+            return self._json({"error": "not found"}, 404)
         try:
-            body = self._body()
+            body = read_json_body(self)
+            if not isinstance(body, dict):
+                raise ValueError("request body must be an object")
             if path == "/agent/register":
                 return self._json(self.server.registry.register(str(body.get("name") or ""), str(body.get("instance_id") or ""), body.get("system_info") or {}))
             if path == "/agent/poll":
                 call = self.server.registry.poll(str(body["agent_id"]), int(body.get("wait_seconds", 20)))
                 if call is None:
-                    self.send_response(204); self.send_header("Content-Length", "0"); self.end_headers(); return
+                    self.send_response(204)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 return self._json(call)
             if path == "/agent/result":
                 response = body.get("response")
@@ -80,7 +97,9 @@ class AgentHandler(BaseHTTPRequestHandler):
             if path == "/agent/disconnect":
                 self.server.registry.disconnect(str(body["agent_id"]))
                 return self._json({"ok": True})
-            return self._json({"error": "not found"}, 404)
+        except HTTPRequestError as exc:
+            self.close_connection = True
+            return self._json({"error": str(exc)}, exc.status)
         except KeyError as exc:
             return self._json({"error": str(exc)}, 404)
         except Exception as exc:

@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import stat
@@ -97,13 +98,14 @@ class HostTools(ParityHostToolsMixin):
         self._jobs_lock = threading.RLock()
         self._load_persisted_jobs()
 
-    def _path(self, raw: str | None) -> Path:
+    def _path(self, raw: str | None, *, follow_symlinks: bool = True) -> Path:
         if raw is None or raw == "":
             return Path(self.cwd)
         p = Path(raw).expanduser()
         if not p.is_absolute():
             p = Path(self.cwd) / p
-        return p.resolve(strict=False)
+        # File operations must act on the link itself, never the link target.
+        return p.resolve(strict=False) if follow_symlinks else Path(os.path.abspath(p))
 
     def system_info(self) -> dict[str, Any]:
         return {
@@ -124,9 +126,9 @@ class HostTools(ParityHostToolsMixin):
         }
 
     def path_info(self, path: str) -> dict[str, Any]:
-        p = self._path(path)
+        p = self._path(path, follow_symlinks=False)
         st = p.lstat()
-        kind = "directory" if p.is_dir() else "file" if p.is_file() else "symlink" if p.is_symlink() else "other"
+        kind = "symlink" if p.is_symlink() else "directory" if p.is_dir() else "file" if p.is_file() else "other"
         result: dict[str, Any] = {
             "path": str(p),
             "kind": kind,
@@ -154,7 +156,7 @@ class HostTools(ParityHostToolsMixin):
                     st = entry.stat(follow_symlinks=False)
                     entries.append({
                         "name": entry.name,
-                        "path": str(Path(entry.path).resolve(strict=False)),
+                        "path": os.path.abspath(entry.path),
                         "kind": "directory" if entry.is_dir(follow_symlinks=False) else "file" if entry.is_file(follow_symlinks=False) else "symlink" if entry.is_symlink() else "other",
                         "size": st.st_size,
                         "mtime": st.st_mtime,
@@ -282,7 +284,7 @@ class HostTools(ParityHostToolsMixin):
         recursive: bool = False,
         mode: str | None = None,
     ) -> dict[str, Any]:
-        p = self._path(path)
+        p = self._path(path, follow_symlinks=False)
         if action == "mkdir":
             p.mkdir(parents=recursive, exist_ok=True)
         elif action == "touch":
@@ -299,16 +301,16 @@ class HostTools(ParityHostToolsMixin):
         elif action in {"copy", "move"}:
             if not destination:
                 raise ValueError("destination is required for copy/move")
-            dest = self._path(destination)
+            dest = self._path(destination, follow_symlinks=False)
             dest.parent.mkdir(parents=True, exist_ok=True)
             if action == "move":
                 shutil.move(str(p), str(dest))
-            elif p.is_dir():
+            elif p.is_dir() and not p.is_symlink():
                 if not recursive:
                     raise ValueError("recursive=true is required to copy directories")
-                shutil.copytree(p, dest, dirs_exist_ok=True)
+                shutil.copytree(p, dest, dirs_exist_ok=True, symlinks=True)
             else:
-                shutil.copy2(p, dest)
+                shutil.copy2(p, dest, follow_symlinks=False)
             return {"action": action, "path": str(p), "destination": str(dest)}
         elif action == "chmod":
             if mode is None:
@@ -385,8 +387,16 @@ class HostTools(ParityHostToolsMixin):
             return {"root": str(root), "query": query, "results": results, "truncated": len(results) >= limit, "engine": "rg"}
 
         results = []
-        paths = [root] if root.is_file() else (Path(dp) / n for dp, _, files in os.walk(root) for n in files)
-        needle = query if fixed_strings else query
+        matcher = re.compile(re.escape(query) if fixed_strings else query)
+        if root.is_file():
+            paths = [root]
+        else:
+            def walk():
+                for dp, dirs, files in os.walk(root, followlinks=False):
+                    dirs[:] = [d for d in dirs if d != ".git"]
+                    for filename in files:
+                        yield Path(dp) / filename
+            paths = walk()
         for file_path in paths:
             if glob:
                 try:
@@ -398,8 +408,12 @@ class HostTools(ParityHostToolsMixin):
             try:
                 with file_path.open("r", encoding="utf-8", errors="ignore") as f:
                     for line_no, line in enumerate(f, 1):
-                        if needle in line:
-                            results.append(f"{file_path}:{line_no}:{line.rstrip()}")
+                        match = matcher.search(line)
+                        if match is not None:
+                            # Match ripgrep's 1-based UTF-8 byte column format.
+                            column = len(line[:match.start()].encode("utf-8")) + 1
+                            line_text = line.rstrip("\r\n")
+                            results.append(f"{file_path}:{line_no}:{column}:{line_text}")
                             if len(results) >= limit:
                                 return {"root": str(root), "query": query, "results": results, "truncated": True, "engine": "python"}
             except (OSError, UnicodeError):

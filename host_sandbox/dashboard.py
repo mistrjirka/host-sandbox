@@ -3,8 +3,9 @@ from __future__ import annotations
 from html import escape
 
 
-def dashboard_html(host_name: str) -> str:
+def dashboard_html(host_name: str, *, requires_auth: bool = False) -> str:
     name = escape(host_name)
+    token_panel = '<div class="pill"><label>Access token <input type="password" id="api-token" autocomplete="off" placeholder="Enter dashboard token"></label></div>' if requires_auth else ''
     return f'''<!doctype html>
 <html lang="en">
 <head>
@@ -26,7 +27,7 @@ footer{{color:var(--muted);font:12px system-ui,sans-serif;margin-top:12px}} @med
 </style>
 </head>
 <body><main>
-<header><div><h1>Host Sandbox <span class="host" id="hostName">{name}</span></h1><div class="sub">Live observable tool activity on the real host OS</div></div><div class="pill danger">HOST MODE · NOT CONTAINERIZED</div></header>
+<header><div><h1>Host Sandbox <span class="host" id="hostName">{name}</span></h1><div class="sub">Live observable tool activity on the real host OS</div></div>{token_panel}<div class="pill danger">HOST MODE · NOT CONTAINERIZED</div></header>
 <section class="grid">
  <div class="card"><div class="label">Connection</div><div class="value" id="connection">starting</div></div>
  <div class="card"><div class="label">Tool calls</div><div class="value" id="calls">0</div></div>
@@ -45,7 +46,8 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'
 const dur=s=>{{s=Math.max(0,Math.floor(s)); if(s<60)return s+'s'; if(s<3600)return Math.floor(s/60)+'m '+s%60+'s'; return Math.floor(s/3600)+'h '+Math.floor(s%3600/60)+'m'}};
 function renderEvents(){{const q=$('#filter').value.toLowerCase(); ev.innerHTML=rows.filter(x=>!q||JSON.stringify(x).toLowerCase().includes(q)).map(x=>{{const t=new Date(x.ts*1000).toLocaleTimeString(); const d=Object.keys(x.data||{{}}).length?`<details><summary class="small">details</summary><pre>${{esc(JSON.stringify(x.data,null,2))}}</pre></details>`:'';return `<div class="event ${{esc(x.status)}}"><div class="time">${{esc(t)}}</div><div class="kind">${{esc(x.kind)}}</div><div class="summary">${{esc(x.summary)}}${{d}}</div></div>`}}).join(''); if(!paused)ev.scrollTop=ev.scrollHeight}}
 function renderJobs(list){{jobs.innerHTML=list.length?list.map(j=>`<div class="job"><div class="jobtop"><b>${{esc(j.id)}}</b><span class="${{j.status==='running'?'runtime':j.exit_code===0?'oktxt':'badtxt'}}">${{esc(j.status)}}${{j.exit_code==null?'':' · '+j.exit_code}}</span></div><div class="cmd">${{esc(j.command)}}</div><div class="small">pid ${{esc(j.pid)}} · ${{dur(j.duration_seconds||0)}} · ${{esc(j.cwd)}}</div>${{j.output_tail?`<details><summary class="small">output tail</summary><pre>${{esc(j.output_tail)}}</pre></details>`:''}}</div>`).join(''):'<div class="small">No command jobs yet.</div>'}}
-async function tick(){{try{{const [s,e,j]=await Promise.all([fetch('/api/status').then(r=>r.json()),fetch('/api/events?after='+last).then(r=>r.json()),fetch('/api/jobs').then(r=>r.json())]); $('#connection').textContent='connected'; $('#connection').className='value oktxt'; $('#calls').textContent=s.tool_calls; $('#running').textContent=s.running_jobs; $('#uptime').textContent=dur(s.uptime_seconds); $('#hostName').textContent=s.host_name; if(!paused&&e.events.length){{rows.push(...e.events); if(rows.length>800)rows=rows.slice(-800); last=e.events[e.events.length-1].id; renderEvents()}} renderJobs(j.jobs||[])}}catch(err){{$('#connection').textContent='disconnected';$('#connection').className='value badtxt'}}}}
-$('#pause').addEventListener('click',()=>{{paused=!paused;$('#pause').textContent=paused?'Resume':'Pause';if(!paused)renderEvents()}}); $('#clear').addEventListener('click',()=>{{rows=[];renderEvents()}}); $('#filter').addEventListener('input',renderEvents); tick(); setInterval(tick,1000);
+async function jsonGet(url){{const input=$('#api-token'); const headers=input&&input.value?{{Authorization:'Bearer '+input.value}}:{{}};const r=await fetch(url,{{headers}});if(!r.ok)throw Error('HTTP '+r.status);return r.json()}}
+async function tick(){{try{{const [s,e,j]=await Promise.all([jsonGet('/api/status'),jsonGet('/api/events?after='+last),jsonGet('/api/jobs')]); $('#connection').textContent='connected'; $('#connection').className='value oktxt'; $('#calls').textContent=s.tool_calls; $('#running').textContent=s.running_jobs; $('#uptime').textContent=dur(s.uptime_seconds); $('#hostName').textContent=s.host_name; if(!paused&&e.events.length){{rows.push(...e.events); if(rows.length>800)rows=rows.slice(-800); last=e.events[e.events.length-1].id; renderEvents()}} renderJobs(j.jobs||[])}}catch(err){{$('#connection').textContent='disconnected';$('#connection').className='value badtxt'}}}}
+$('#api-token')?.addEventListener('input',()=>tick()); $('#pause').addEventListener('click',()=>{{paused=!paused;$('#pause').textContent=paused?'Resume':'Pause';if(!paused)renderEvents()}}); $('#clear').addEventListener('click',()=>{{rows=[];renderEvents()}}); $('#filter').addEventListener('input',renderEvents); tick(); setInterval(tick,1000);
 }})();
 </script></main></body></html>'''

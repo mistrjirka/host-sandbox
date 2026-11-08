@@ -15,19 +15,34 @@ from host_sandbox.mcp import MCPServer
 class Smoke(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); root = Path(self.tmp.name); self.audit = AuditLog(root/"state"); self.tools = HostTools(self.audit, root/"state", str(root)); self.mcp = MCPServer(self.tools, self.audit)
-    def tearDown(self): self.tools.close(); self.tmp.cleanup()
+    def tearDown(self):
+        for job in list(self.tools._jobs.values()):
+            if job.status() not in TERMINAL_JOB_STATES:
+                self.tools.signal_job(job.id, "KILL", 1)
+            if job.process is not None:
+                job.process.wait(timeout=3)
+        self.tools.close()
+        self.tmp.cleanup()
+
+    def await_job(self, job_id, timeout=8):
+        deadline = time.monotonic() + timeout
+        job = self.call("read_job", {"job_id": job_id})
+        while job["status"] not in TERMINAL_JOB_STATES and time.monotonic() < deadline:
+            time.sleep(0.05)
+            job = self.call("read_job", {"job_id": job_id})
+        self.assertIn(job["status"], TERMINAL_JOB_STATES)
+        return job
     def call(self, name, args):
         r=self.mcp.handle({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":args}}); self.assertIsNotNone(r); return r["result"]["structuredContent"]
     def test_files_and_binary_transfer(self):
         self.call("write_file", {"path":"a.txt","content":"hello"}); self.assertEqual(self.call("read_file", {"path":"a.txt"})["text"],"hello")
         chunk=self.call("read_file_chunk", {"path":"a.txt"}); self.call("write_file_chunk", {"path":"b.bin","data_base64":chunk["data_base64"],"truncate_after":True}); self.assertEqual((Path(self.tmp.name)/"b.bin").read_bytes(),b"hello")
     def test_exec_and_job(self):
-        r=self.call("exec_command", {"command":"printf abc","wait_seconds":2}); self.assertEqual(r["exit_code"],0); self.assertIn("abc",r["output_tail"])
+        r=self.call("exec_command", {"command":"printf abc","wait_seconds":2})
+        rr=self.await_job(r["id"])
+        self.assertEqual(rr["exit_code"],0); self.assertIn("abc",rr["output"])
         r=self.call("exec_command", {"command":"sleep .2; printf done","wait_seconds":0})
-        deadline=time.time()+2
-        rr=self.call("read_job", {"job_id":r["id"]})
-        while rr["status"] not in {"finished","failed","timed_out","cancelled","interrupted"} and time.time()<deadline:
-            time.sleep(.05); rr=self.call("read_job", {"job_id":r["id"]})
+        rr=self.await_job(r["id"])
         self.assertEqual(rr["exit_code"],0); self.assertIn("done",rr["output"])
     def test_exec_preserves_inherited_path_and_user_shell(self):
         with patch.dict(os.environ, {"PATH":"/sentinel:/usr/bin:/bin", "SHELL":"/bin/sh"}, clear=False):
